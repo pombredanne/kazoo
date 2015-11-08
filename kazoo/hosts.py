@@ -1,32 +1,6 @@
 import random
 
-
-class HostIterator(object):
-    """An iterator that returns selected hosts in order.
-
-    A host is guaranteed to not be selected twice unless there is only
-    one host in the collection.
-    """
-
-    def __init__(self, hosts):
-        self.hosts = hosts
-
-    def __iter__(self):
-        for host in self.hosts[:]:
-            yield host
-
-    def __len__(self):
-        return len(self.hosts)
-
-
-class RandomHostIterator(HostIterator):
-    """An iterator that returns a randomly selected host."""
-
-    def __iter__(self):
-        hostslist = self.hosts[:]
-        random.shuffle(hostslist)
-        for host in hostslist:
-            yield host
+from six.moves import urllib_parse
 
 
 def collect_hosts(hosts, randomize=True):
@@ -36,9 +10,16 @@ def collect_hosts(hosts, randomize=True):
 
     result = []
     for host_port in host_ports.split(","):
-        host, port = host_port.partition(":")[::2]
-        port = int(port.strip()) if port else 2181
+        # put all complexity of dealing with
+        # IPv4 & IPv6 address:port on the urlsplit
+        res = urllib_parse.urlsplit("xxx://" + host_port)
+        host = res.hostname
+        if host is None:
+            raise ValueError("bad hostname")
+        port = int(res.port) if res.port else 2181
         result.append((host.strip(), port))
+
     if randomize:
-        return (RandomHostIterator(result), chroot)
-    return (HostIterator(result), chroot)
+        random.shuffle(result)
+
+    return result, chroot

@@ -1,20 +1,75 @@
-import uuid
+import collections
 import threading
+import time
+import uuid
 
-from nose.tools import eq_
+from nose.tools import eq_, ok_
 
 from kazoo.exceptions import CancelledError
+from kazoo.exceptions import LockTimeout
 from kazoo.testing import KazooTestCase
-from kazoo.tests.util import wait
+from kazoo.tests import util as test_util
+
+
+class SleepBarrier(object):
+    """A crappy spinning barrier."""
+
+    def __init__(self, wait_for, sleep_func):
+        self._wait_for = wait_for
+        self._arrived = collections.deque()
+        self._sleep_func = sleep_func
+
+    def __enter__(self):
+        self._arrived.append(threading.current_thread())
+        return self
+
+    def __exit__(self, type, value, traceback):
+        try:
+            self._arrived.remove(threading.current_thread())
+        except ValueError:
+            pass
+
+    def wait(self):
+        while len(self._arrived) < self._wait_for:
+            self._sleep_func(0.001)
 
 
 class KazooLockTests(KazooTestCase):
+    thread_count = 20
+
+    def __init__(self, *args, **kw):
+        super(KazooLockTests, self).__init__(*args, **kw)
+        self.threads_made = []
+
+    def tearDown(self):
+        super(KazooLockTests, self).tearDown()
+        while self.threads_made:
+            t = self.threads_made.pop()
+            t.join()
+
+    @staticmethod
+    def make_condition():
+        return threading.Condition()
+
+    @staticmethod
+    def make_event():
+        return threading.Event()
+
+    def make_thread(self, *args, **kwargs):
+        t = threading.Thread(*args, **kwargs)
+        t.daemon = True
+        self.threads_made.append(t)
+        return t
+
+    @staticmethod
+    def make_wait():
+        return test_util.Wait()
+
     def setUp(self):
         super(KazooLockTests, self).setUp()
         self.lockpath = "/" + uuid.uuid4().hex
-
-        self.condition = threading.Condition()
-        self.released = threading.Event()
+        self.condition = self.make_condition()
+        self.released = self.make_event()
         self.active_thread = None
         self.cancelled_threads = []
 
@@ -41,16 +96,16 @@ class KazooLockTests(KazooTestCase):
     def test_lock_one(self):
         lock_name = uuid.uuid4().hex
         lock = self.client.Lock(self.lockpath, lock_name)
-        event = threading.Event()
-
-        thread = threading.Thread(target=self._thread_lock_acquire_til_event,
-            args=(lock_name, lock, event))
+        event = self.make_event()
+        thread = self.make_thread(target=self._thread_lock_acquire_til_event,
+                                  args=(lock_name, lock, event))
         thread.start()
 
         lock2_name = uuid.uuid4().hex
         anotherlock = self.client.Lock(self.lockpath, lock2_name)
 
         # wait for any contender to show up on the lock
+        wait = self.make_wait()
         wait(anotherlock.contenders)
         eq_(anotherlock.contenders(), [lock_name])
 
@@ -65,6 +120,7 @@ class KazooLockTests(KazooTestCase):
             while self.active_thread:
                 self.condition.wait()
         self.released.wait()
+        thread.join()
 
     def test_lock(self):
         threads = []
@@ -73,11 +129,10 @@ class KazooLockTests(KazooTestCase):
         contender_bits = {}
 
         for name in names:
-            e = threading.Event()
-
+            e = self.make_event()
             l = self.client.Lock(self.lockpath, name)
-            t = threading.Thread(target=self._thread_lock_acquire_til_event,
-                args=(name, l, e))
+            t = self.make_thread(target=self._thread_lock_acquire_til_event,
+                                 args=(name, l, e))
             contender_bits[name] = (t, e)
             threads.append(t)
 
@@ -89,6 +144,7 @@ class KazooLockTests(KazooTestCase):
             t.start()
 
         # wait for everyone to line up on the lock
+        wait = self.make_wait()
         wait(lambda: len(lock.contenders()) == 6)
         contenders = lock.contenders()
 
@@ -115,13 +171,64 @@ class KazooLockTests(KazooTestCase):
             with self.condition:
                 while self.active_thread:
                     self.condition.wait()
+        for thread in threads:
             thread.join()
 
+    def test_lock_reconnect(self):
+        event = self.make_event()
+        other_lock = self.client.Lock(self.lockpath, 'contender')
+        thread = self.make_thread(target=self._thread_lock_acquire_til_event,
+                                  args=('contender', other_lock, event))
+
+        # acquire the lock ourselves first to make the contender line up
+        lock = self.client.Lock(self.lockpath, "test")
+        lock.acquire()
+
+        thread.start()
+        # wait for the contender to line up on the lock
+        wait = self.make_wait()
+        wait(lambda: len(lock.contenders()) == 2)
+        eq_(lock.contenders(), ['test', 'contender'])
+
+        self.expire_session(self.make_event)
+
+        lock.release()
+
+        with self.condition:
+            while not self.active_thread:
+                self.condition.wait()
+            eq_(self.active_thread, 'contender')
+
+        event.set()
+        thread.join()
+
+    def test_lock_non_blocking(self):
+        lock_name = uuid.uuid4().hex
+        lock = self.client.Lock(self.lockpath, lock_name)
+        event = self.make_event()
+
+        thread = self.make_thread(target=self._thread_lock_acquire_til_event,
+                                  args=(lock_name, lock, event))
+        thread.start()
+
+        lock1 = self.client.Lock(self.lockpath, lock_name)
+
+        # wait for the thread to acquire the lock
+        with self.condition:
+            if not self.active_thread:
+                self.condition.wait(5)
+
+        ok_(not lock1.acquire(blocking=False))
+        eq_(lock.contenders(), [lock_name])  # just one - itself
+
+        event.set()
+        thread.join()
+
     def test_lock_fail_first_call(self):
-        event1 = threading.Event()
+        event1 = self.make_event()
         lock1 = self.client.Lock(self.lockpath, "one")
-        thread1 = threading.Thread(target=self._thread_lock_acquire_til_event,
-            args=("one", lock1, event1))
+        thread1 = self.make_thread(target=self._thread_lock_acquire_til_event,
+                                   args=("one", lock1, event1))
         thread1.start()
 
         # wait for this thread to acquire the lock
@@ -134,10 +241,10 @@ class KazooLockTests(KazooTestCase):
         thread1.join()
 
     def test_lock_cancel(self):
-        event1 = threading.Event()
+        event1 = self.make_event()
         lock1 = self.client.Lock(self.lockpath, "one")
-        thread1 = threading.Thread(target=self._thread_lock_acquire_til_event,
-            args=("one", lock1, event1))
+        thread1 = self.make_thread(target=self._thread_lock_acquire_til_event,
+                                   args=("one", lock1, event1))
         thread1.start()
 
         # wait for this thread to acquire the lock
@@ -148,19 +255,20 @@ class KazooLockTests(KazooTestCase):
 
         client2 = self._get_client()
         client2.start()
-        event2 = threading.Event()
+        event2 = self.make_event()
         lock2 = client2.Lock(self.lockpath, "two")
-        thread2 = threading.Thread(target=self._thread_lock_acquire_til_event,
-            args=("two", lock2, event2))
+        thread2 = self.make_thread(target=self._thread_lock_acquire_til_event,
+                                   args=("two", lock2, event2))
         thread2.start()
 
         # this one should block in acquire. check that it is a contender
+        wait = self.make_wait()
         wait(lambda: len(lock2.contenders()) > 1)
         eq_(lock2.contenders(), ["one", "two"])
 
         lock2.cancel()
         with self.condition:
-            if not "two" in self.cancelled_threads:
+            if "two" not in self.cancelled_threads:
                 self.condition.wait()
                 assert "two" in self.cancelled_threads
 
@@ -171,21 +279,157 @@ class KazooLockTests(KazooTestCase):
         thread1.join()
         client2.stop()
 
-    def test_lock_double_calls(self):
+    def test_lock_no_double_calls(self):
         lock1 = self.client.Lock(self.lockpath, "one")
         lock1.acquire()
-        lock1.acquire()
+        self.assertTrue(lock1.is_acquired)
+        self.assertFalse(lock1.acquire(timeout=0.5))
+        self.assertTrue(lock1.is_acquired)
         lock1.release()
-        lock1.release()
+        self.assertFalse(lock1.is_acquired)
+
+    def test_lock_same_thread_no_block(self):
+        lock = self.client.Lock(self.lockpath, "one")
+        gotten = lock.acquire(blocking=False)
+        self.assertTrue(gotten)
+        self.assertTrue(lock.is_acquired)
+        gotten = lock.acquire(blocking=False)
+        self.assertFalse(gotten)
+
+    def test_lock_many_threads_no_block(self):
+        lock = self.client.Lock(self.lockpath, "one")
+        attempts = collections.deque()
+
+        def _acquire():
+            attempts.append(int(lock.acquire(blocking=False)))
+
+        threads = []
+        for _i in range(0, self.thread_count):
+            t = self.make_thread(target=_acquire)
+            threads.append(t)
+            t.start()
+
+        while threads:
+            t = threads.pop()
+            t.join()
+
+        self.assertEqual(1, sum(list(attempts)))
+
+    def test_lock_many_threads(self):
+        sleep_func = self.client.handler.sleep_func
+        lock = self.client.Lock(self.lockpath, "one")
+        acquires = collections.deque()
+        chain = collections.deque()
+        differences = collections.deque()
+        barrier = SleepBarrier(self.thread_count, sleep_func)
+
+        def _acquire():
+            # Wait until all threads are ready to go...
+            with barrier as b:
+                b.wait()
+                with lock:
+                    # Ensure that no two threads enter here and cause the
+                    # count to differ by more than one, do this by recording
+                    # the count that was captured and examining it post run.
+                    starting_count = len(acquires)
+                    acquires.append(1)
+                    sleep_func(0.01)
+                    end_count = len(acquires)
+                    differences.append(end_count - starting_count)
+
+        threads = []
+        for _i in range(0, self.thread_count):
+            t = self.make_thread(target=_acquire)
+            threads.append(t)
+            t.start()
+
+        while threads:
+            t = threads.pop()
+            t.join()
+
+        self.assertEqual(self.thread_count, len(acquires))
+        self.assertEqual([1] * self.thread_count, list(differences))
+
+    def test_lock_reacquire(self):
+        lock = self.client.Lock(self.lockpath, "one")
+        lock.acquire()
+        lock.release()
+        lock.acquire()
+        lock.release()
+
+    def test_lock_timeout(self):
+        timeout = 3
+        e = self.make_event()
+        started = self.make_event()
+
+        # In the background thread, acquire the lock and wait thrice the time
+        # that the main thread is going to wait to acquire the lock.
+        lock1 = self.client.Lock(self.lockpath, "one")
+
+        def _thread(lock, event, timeout):
+            with lock:
+                started.set()
+                event.wait(timeout)
+                if not event.isSet():
+                    # Eventually fail to avoid hanging the tests
+                    self.fail("lock2 never timed out")
+
+        t = self.make_thread(target=_thread, args=(lock1, e, timeout * 3))
+        t.start()
+
+        # Start the main thread's kazoo client and try to acquire the lock
+        # but give up after `timeout` seconds
+        client2 = self._get_client()
+        client2.start()
+        started.wait(5)
+        self.assertTrue(started.isSet())
+        lock2 = client2.Lock(self.lockpath, "two")
+        try:
+            lock2.acquire(timeout=timeout)
+        except LockTimeout:
+            # A timeout is the behavior we're expecting, since the background
+            # thread should still be holding onto the lock
+            pass
+        else:
+            self.fail("Main thread unexpectedly acquired the lock")
+        finally:
+            # Cleanup
+            e.set()
+            t.join()
+            client2.stop()
 
 
 class TestSemaphore(KazooTestCase):
+
+    def __init__(self, *args, **kw):
+        super(TestSemaphore, self).__init__(*args, **kw)
+        self.threads_made = []
+
+    def tearDown(self):
+        super(TestSemaphore, self).tearDown()
+        while self.threads_made:
+            t = self.threads_made.pop()
+            t.join()
+
+    @staticmethod
+    def make_condition():
+        return threading.Condition()
+
+    @staticmethod
+    def make_event():
+        return threading.Event()
+
+    def make_thread(self, *args, **kwargs):
+        t = threading.Thread(*args, **kwargs)
+        t.daemon = True
+        self.threads_made.append(t)
+        return t
+
     def setUp(self):
         super(TestSemaphore, self).setUp()
         self.lockpath = "/" + uuid.uuid4().hex
-
-        self.condition = threading.Condition()
-        self.released = threading.Event()
+        self.condition = self.make_condition()
+        self.released = self.make_event()
         self.active_thread = None
         self.cancelled_threads = []
 
@@ -197,8 +441,8 @@ class TestSemaphore(KazooTestCase):
     def test_lock_one(self):
         sem1 = self.client.Semaphore(self.lockpath, max_leases=1)
         sem2 = self.client.Semaphore(self.lockpath, max_leases=1)
-        started = threading.Event()
-        event = threading.Event()
+        started = self.make_event()
+        event = self.make_event()
 
         sem1.acquire()
 
@@ -207,39 +451,72 @@ class TestSemaphore(KazooTestCase):
             with sem2:
                 event.set()
 
-        thread = threading.Thread(target=sema_one, args=())
+        thread = self.make_thread(target=sema_one, args=())
         thread.start()
-        started.wait()
+        started.wait(10)
 
         self.assertFalse(event.is_set())
 
         sem1.release()
-        event.wait()
+        event.wait(10)
         self.assert_(event.is_set())
+        thread.join()
+
+    def test_non_blocking(self):
+        sem1 = self.client.Semaphore(
+            self.lockpath, identifier='sem1', max_leases=2)
+        sem2 = self.client.Semaphore(
+            self.lockpath, identifier='sem2', max_leases=2)
+        sem3 = self.client.Semaphore(
+            self.lockpath, identifier='sem3', max_leases=2)
+
+        sem1.acquire()
+        sem2.acquire()
+        ok_(not sem3.acquire(blocking=False))
+        eq_(set(sem1.lease_holders()), set(['sem1', 'sem2']))
+        sem2.release()
+        # the next line isn't required, but avoids timing issues in tests
+        sem3.acquire()
+        eq_(set(sem1.lease_holders()), set(['sem1', 'sem3']))
+        sem1.release()
+        sem3.release()
+
+    def test_non_blocking_release(self):
+        sem1 = self.client.Semaphore(
+            self.lockpath, identifier='sem1', max_leases=1)
+        sem2 = self.client.Semaphore(
+            self.lockpath, identifier='sem2', max_leases=1)
+        sem1.acquire()
+        sem2.acquire(blocking=False)
+
+        # make sure there's no shutdown / cleanup error
+        sem1.release()
+        sem2.release()
 
     def test_holders(self):
-        started = threading.Event()
-        event = threading.Event()
+        started = self.make_event()
+        event = self.make_event()
 
         def sema_one():
             with self.client.Semaphore(self.lockpath, 'fred', max_leases=1):
                 started.set()
                 event.wait()
 
-        thread = threading.Thread(target=sema_one, args=())
+        thread = self.make_thread(target=sema_one, args=())
         thread.start()
         started.wait()
         sem1 = self.client.Semaphore(self.lockpath)
         holders = sem1.lease_holders()
         eq_(holders, ['fred'])
         event.set()
+        thread.join()
 
     def test_semaphore_cancel(self):
         sem1 = self.client.Semaphore(self.lockpath, 'fred', max_leases=1)
         sem2 = self.client.Semaphore(self.lockpath, 'george', max_leases=1)
         sem1.acquire()
-        started = threading.Event()
-        event = threading.Event()
+        started = self.make_event()
+        event = self.make_event()
 
         def sema_one():
             started.set()
@@ -249,7 +526,7 @@ class TestSemaphore(KazooTestCase):
             except CancelledError:
                 event.set()
 
-        thread = threading.Thread(target=sema_one, args=())
+        thread = self.make_thread(target=sema_one, args=())
         thread.start()
         started.wait()
         eq_(sem1.lease_holders(), ['fred'])
@@ -257,6 +534,7 @@ class TestSemaphore(KazooTestCase):
         sem2.cancel()
         event.wait()
         eq_(event.is_set(), True)
+        thread.join()
 
     def test_multiple_acquire_and_release(self):
         sem1 = self.client.Semaphore(self.lockpath, 'fred', max_leases=1)
@@ -275,9 +553,9 @@ class TestSemaphore(KazooTestCase):
         lh_semaphore = client.Semaphore(self.lockpath, 'george', max_leases=1)
         lh_semaphore.acquire()
 
-        started = threading.Event()
-        event = threading.Event()
-        event2 = threading.Event()
+        started = self.make_event()
+        event = self.make_event()
+        event2 = self.make_event()
 
         def sema_one():
             started.set()
@@ -285,27 +563,101 @@ class TestSemaphore(KazooTestCase):
                 event.set()
                 event2.wait()
 
-        thread = threading.Thread(target=sema_one, args=())
-        thread.start()
+        thread1 = self.make_thread(target=sema_one, args=())
+        thread1.start()
 
         started.wait()
         eq_(lh_semaphore.lease_holders(), ['george'])
 
         # Fired in a separate thread to make sure we can see the effect
-        expired = threading.Event()
+        expired = self.make_event()
 
         def expire():
-            self.expire_session()
+            self.expire_session(self.make_event)
             expired.set()
 
-        thread = threading.Thread(target=expire, args=())
-        thread.start()
+        thread2 = self.make_thread(target=expire, args=())
+        thread2.start()
         expire_semaphore.wake_event.wait()
         expired.wait()
 
         lh_semaphore.release()
         client.stop()
 
-        event.wait(5)
+        event.wait(15)
         eq_(expire_semaphore.lease_holders(), ['fred'])
         event2.set()
+
+        for t in (thread1, thread2):
+            t.join()
+
+    def test_inconsistent_max_leases(self):
+        sem1 = self.client.Semaphore(self.lockpath, max_leases=1)
+        sem2 = self.client.Semaphore(self.lockpath, max_leases=2)
+
+        sem1.acquire()
+        self.assertRaises(ValueError, sem2.acquire)
+
+    def test_inconsistent_max_leases_other_data(self):
+        sem1 = self.client.Semaphore(self.lockpath, max_leases=1)
+        sem2 = self.client.Semaphore(self.lockpath, max_leases=2)
+
+        self.client.ensure_path(self.lockpath)
+        self.client.set(self.lockpath, b'a$')
+
+        sem1.acquire()
+        # sem2 thinks it's ok to have two lease holders
+        ok_(sem2.acquire(blocking=False))
+
+    def test_reacquire(self):
+        lock = self.client.Semaphore(self.lockpath)
+        lock.acquire()
+        lock.release()
+        lock.acquire()
+        lock.release()
+
+    def test_acquire_after_cancelled(self):
+        lock = self.client.Semaphore(self.lockpath)
+        self.assertTrue(lock.acquire())
+        self.assertTrue(lock.release())
+        lock.cancel()
+        self.assertTrue(lock.cancelled)
+        self.assertTrue(lock.acquire())
+
+    def test_timeout(self):
+        timeout = 3
+        e = self.make_event()
+        started = self.make_event()
+
+        # In the background thread, acquire the lock and wait thrice the time
+        # that the main thread is going to wait to acquire the lock.
+        sem1 = self.client.Semaphore(self.lockpath, "one")
+
+        def _thread(sem, event, timeout):
+            with sem:
+                started.set()
+                event.wait(timeout)
+                if not event.isSet():
+                    # Eventually fail to avoid hanging the tests
+                    self.fail("sem2 never timed out")
+
+        t = self.make_thread(target=_thread, args=(sem1, e, timeout * 3))
+        t.start()
+
+        # Start the main thread's kazoo client and try to acquire the lock
+        # but give up after `timeout` seconds
+        client2 = self._get_client()
+        client2.start()
+        started.wait(5)
+        self.assertTrue(started.isSet())
+        sem2 = client2.Semaphore(self.lockpath, "two")
+        try:
+            sem2.acquire(timeout=timeout)
+        except LockTimeout:
+            # A timeout is the behavior we're expecting, since the background
+            # thread will still be holding onto the lock
+            e.set()
+        finally:
+            # Cleanup
+            t.join()
+            client2.stop()

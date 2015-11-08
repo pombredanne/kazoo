@@ -13,7 +13,16 @@
 ##############################################################################
 
 import logging
+import os
 import time
+
+TRAVIS = os.environ.get('TRAVIS', False)
+TRAVIS_ZK_VERSION = TRAVIS and os.environ.get('ZOOKEEPER_VERSION', None)
+if TRAVIS_ZK_VERSION:
+    if '-' in TRAVIS_ZK_VERSION:
+        # Ignore pre-release markers like -alpha
+        TRAVIS_ZK_VERSION = TRAVIS_ZK_VERSION.split('-')[0]
+    TRAVIS_ZK_VERSION = tuple([int(n) for n in TRAVIS_ZK_VERSION.split('.')])
 
 
 class Handler(logging.Handler):
@@ -56,8 +65,7 @@ class Handler(logging.Handler):
                           if line.strip()])
                )
               )
-              for record in self.records]
-              )
+             for record in self.records])
 
 
 class InstalledHandler(Handler):

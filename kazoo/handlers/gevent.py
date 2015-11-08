@@ -1,24 +1,24 @@
 """A gevent based handler."""
 from __future__ import absolute_import
 
-import atexit
 import logging
 
 import gevent
-import gevent.queue
-import gevent.coros
 import gevent.event
-import gevent.thread
+import gevent.queue
 import gevent.select
+import gevent.thread
 
 from gevent.queue import Empty
 from gevent.queue import Queue
 from gevent import socket
-from zope.interface import implementer
+try:
+    from gevent.lock import Semaphore, RLock
+except ImportError:
+    from gevent.coros import Semaphore, RLock
 
-from kazoo.handlers.utils import create_tcp_socket
-from kazoo.interfaces import IAsyncResult
-from kazoo.interfaces import IHandler
+from kazoo.handlers import utils
+from kazoo import python2atexit
 
 _using_libevent = gevent.__version__.startswith('0.')
 
@@ -26,10 +26,9 @@ log = logging.getLogger(__name__)
 
 _STOP = object()
 
-AsyncResult = implementer(IAsyncResult)(gevent.event.AsyncResult)
+AsyncResult = gevent.event.AsyncResult
 
 
-@implementer(IHandler)
 class SequentialGeventHandler(object):
     """Gevent handler for sequentially executing callbacks.
 
@@ -58,9 +57,8 @@ class SequentialGeventHandler(object):
         self.callback_queue = Queue()
         self._running = False
         self._async = None
-        self._state_change = gevent.coros.Semaphore()
+        self._state_change = Semaphore()
         self._workers = []
-        atexit.register(self.stop)
 
     class timeout_exception(gevent.event.Timeout):
         def __init__(self, msg):
@@ -90,13 +88,11 @@ class SequentialGeventHandler(object):
             self._running = True
 
             # Spawn our worker greenlets, we have
-            # - A completion worker for when values come back to be set on
-            #   the AsyncResult object
             # - A callback worker for watch events to be called
-            # - A session worker for session events to be called
             for queue in (self.callback_queue,):
                 w = self._create_greenlet_worker(queue)
                 self._workers.append(w)
+            python2atexit.register(self.stop)
 
     def stop(self):
         """Stop the greenlet workers and empty all queues."""
@@ -116,11 +112,19 @@ class SequentialGeventHandler(object):
             # Clear the queues
             self.callback_queue = Queue()  # pragma: nocover
 
+            python2atexit.unregister(self.stop)
+
     def select(self, *args, **kwargs):
         return gevent.select.select(*args, **kwargs)
 
     def socket(self, *args, **kwargs):
-        return create_tcp_socket(socket)
+        return utils.create_tcp_socket(socket)
+
+    def create_connection(self, *args, **kwargs):
+        return utils.create_tcp_connection(socket, *args, **kwargs)
+
+    def create_socket_pair(self):
+        return utils.create_socket_pair(socket)
 
     def event_object(self):
         """Create an appropriate Event object"""
@@ -132,7 +136,7 @@ class SequentialGeventHandler(object):
 
     def rlock_object(self):
         """Create an appropriate RLock object"""
-        return gevent.coros.RLock()
+        return RLock()
 
     def async_result(self):
         """Create a :class:`AsyncResult` instance
@@ -147,7 +151,7 @@ class SequentialGeventHandler(object):
 
     def spawn(self, func, *args, **kwargs):
         """Spawn a function to run asynchronously"""
-        gevent.spawn(func, *args, **kwargs)
+        return gevent.spawn(func, *args, **kwargs)
 
     def dispatch_callback(self, callback):
         """Dispatch to the callback object

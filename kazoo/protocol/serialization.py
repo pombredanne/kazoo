@@ -10,6 +10,7 @@ from kazoo.security import Id
 # Struct objects with formats compiled
 bool_struct = struct.Struct('B')
 int_struct = struct.Struct('!i')
+long_struct = struct.Struct('!q')
 int_int_struct = struct.Struct('!ii')
 int_int_long_struct = struct.Struct('!iiq')
 
@@ -54,7 +55,7 @@ def write_string(bytes):
 
 
 def write_buffer(bytes):
-    if not bytes:
+    if bytes is None:
         return int_struct.pack(-1)
     else:
         return int_struct.pack(len(bytes)) + bytes
@@ -64,27 +65,31 @@ def read_buffer(bytes, offset):
     length = int_struct.unpack_from(bytes, offset)[0]
     offset += int_struct.size
     if length < 0:
-        return b'', offset
+        return None, offset
     else:
         index = offset
         offset += length
         return bytes[index:index + length], offset
 
 
-class Close(object):
+class Close(namedtuple('Close', '')):
     type = -11
 
     @classmethod
     def serialize(cls):
         return b''
 
+CloseInstance = Close()
 
-class Ping(object):
+
+class Ping(namedtuple('Ping', '')):
     type = 11
 
     @classmethod
     def serialize(cls):
         return b''
+
+PingInstance = Ping()
 
 
 class Connect(namedtuple('Connect', 'protocol_version last_zxid_seen'
@@ -346,6 +351,24 @@ class Transaction(namedtuple('Transaction', 'operations')):
             else:
                 resp.append(result)
         return resp
+
+
+class Reconfig(namedtuple('Reconfig', 'joining leaving new_members config_id')):
+    type = 16
+
+    def serialize(self):
+        b = bytearray()
+        b.extend(write_string(self.joining))
+        b.extend(write_string(self.leaving))
+        b.extend(write_string(self.new_members))
+        b.extend(long_struct.pack(self.config_id))
+        return b
+
+    @classmethod
+    def deserialize(cls, bytes, offset):
+        data, offset = read_buffer(bytes, offset)
+        stat = ZnodeStat._make(stat_struct.unpack_from(bytes, offset))
+        return data, stat
 
 
 class Auth(namedtuple('Auth', 'auth_type scheme auth')):

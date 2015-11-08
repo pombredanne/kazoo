@@ -1,10 +1,10 @@
 #
 #  Copyright (C) 2010-2011, 2011 Canonical Ltd. All Rights Reserved
 #
-#  This file is part of txzookeeper.
+#  This file was originally taken from txzookeeper and modified later.
 #
 #  Authors:
-#   Kapil Thangavelu
+#   Kapil Thangavelu and the Kazoo team
 #
 #  txzookeeper is free software: you can redistribute it and/or modify
 #  it under the terms of the GNU Lesser General Public License as published by
@@ -18,22 +18,53 @@
 #
 #  You should have received a copy of the GNU Lesser General Public License
 #  along with txzookeeper.  If not, see <http://www.gnu.org/licenses/>.
-#
 
 
+import code
+import logging
 import os
 import os.path
 import shutil
+import signal
 import subprocess
 import tempfile
+import traceback
 
 from itertools import chain
 from collections import namedtuple
 from glob import glob
 
 
+log = logging.getLogger(__name__)
+
+
+def debug(sig, frame):
+    """Interrupt running process, and provide a python prompt for
+    interactive debugging."""
+    d = {'_frame': frame}         # Allow access to frame object.
+    d.update(frame.f_globals)  # Unless shadowed by global
+    d.update(frame.f_locals)
+
+    i = code.InteractiveConsole(d)
+    message = "Signal recieved : entering python shell.\nTraceback:\n"
+    message += ''.join(traceback.format_stack(frame))
+    i.interact(message)
+
+
+def listen():
+    if os.name != 'nt':  # SIGUSR1 is not supported on Windows
+        signal.signal(signal.SIGUSR1, debug)  # Register handler
+listen()
+
+
+def to_java_compatible_path(path):
+    if os.name == 'nt':
+        path = path.replace('\\', '/')
+    return path
+
 ServerInfo = namedtuple(
-    "ServerInfo", "server_id client_port election_port leader_port")
+    "ServerInfo",
+    "server_id client_port election_port leader_port admin_port")
 
 
 class ManagedZooKeeper(object):
@@ -44,13 +75,14 @@ class ManagedZooKeeper(object):
     future, we may want to do that, especially when run in a
     Hudson/Buildbot context, to ensure more test robustness."""
 
-    def __init__(self, software_path, server_info, peers=()):
+    def __init__(self, software_path, server_info, peers=(), classpath=None):
         """Define the ZooKeeper test instance.
 
         @param install_path: The path to the install for ZK
         @param port: The port to run the managed ZK instance
         """
         self.install_path = software_path
+        self._classpath = classpath
         self.server_info = server_info
         self.host = "127.0.0.1"
         self.peers = peers
@@ -83,7 +115,10 @@ tickTime=2000
 dataDir=%s
 clientPort=%s
 maxClientCnxns=0
-""" % (data_path, self.server_info.client_port))
+admin.serverPort=%s
+""" % (to_java_compatible_path(data_path),
+       self.server_info.client_port,
+       self.server_info.admin_port))  # NOQA
 
         # setup a replicated setup if peers are specified
         if self.peers:
@@ -111,25 +146,37 @@ log4j.appender.ROLLINGFILE.layout=org.apache.log4j.PatternLayout
 log4j.appender.ROLLINGFILE.layout.ConversionPattern=%d{ISO8601} [myid:%X{myid}] - %-5p [%t:%C{1}@%L] - %m%n
 log4j.appender.ROLLINGFILE=org.apache.log4j.RollingFileAppender
 log4j.appender.ROLLINGFILE.Threshold=DEBUG
-log4j.appender.ROLLINGFILE.File=""" + (
+log4j.appender.ROLLINGFILE.File=""" + to_java_compatible_path(  # NOQA
                 self.working_path + os.sep + "zookeeper.log\n"))
 
-        self.process = subprocess.Popen(
-            args=["java",
-                  "-cp", self.classpath,
-                  "-Dreadonlymode.enabled=true",
-                  "-Dzookeeper.log.dir=%s" % log_path,
-                  "-Dzookeeper.root.logger=INFO,CONSOLE",
-                  "-Dlog4j.configuration=file:%s" % log4j_path,
-                  # "-Dlog4j.debug",
-                  "org.apache.zookeeper.server.quorum.QuorumPeerMain",
-                  config_path],
-            )
+        args = [
+            "java",
+            "-cp", self.classpath,
+
+            # "-Dlog4j.debug",
+            "-Dreadonlymode.enabled=true",
+            "-Dzookeeper.log.dir=%s" % log_path,
+            "-Dzookeeper.root.logger=INFO,CONSOLE",
+            "-Dlog4j.configuration=file:%s" % log4j_path,
+
+            # OS X: Prevent java from appearing in menu bar, process dock
+            # and from activation of the main workspace on run.
+            "-Djava.awt.headless=true",
+
+            "org.apache.zookeeper.server.quorum.QuorumPeerMain",
+            config_path,
+        ]
+        self.process = subprocess.Popen(args=args)
+        log.info("Started zookeeper process %s using args %s",
+                 self.process.pid, args)
         self._running = True
 
     @property
     def classpath(self):
         """Get the classpath necessary to run ZooKeeper."""
+
+        if self._classpath:
+            return self._classpath
 
         # Two possibilities, as seen in zkEnv.sh:
         # Check for a release - top-level zookeeper-*.jar?
@@ -140,6 +187,16 @@ log4j.appender.ROLLINGFILE.File=""" + (
             jars.extend(glob(os.path.join(
                 self.install_path,
                 "lib/*.jar")))
+            # support for different file locations on Debian/Ubuntu
+            jars.extend(glob(os.path.join(
+                self.install_path,
+                "log4j-*.jar")))
+            jars.extend(glob(os.path.join(
+                self.install_path,
+                "slf4j-api-*.jar")))
+            jars.extend(glob(os.path.join(
+                self.install_path,
+                "slf4j-log4j-*.jar")))
         else:
             # Development build (plain `ant`)
             jars = glob((os.path.join(
@@ -147,7 +204,8 @@ log4j.appender.ROLLINGFILE.File=""" + (
             jars.extend(glob(os.path.join(
                 self.install_path,
                 "build/lib/*.jar")))
-        return ":".join(jars)
+
+        return os.pathsep.join(jars)
 
     @property
     def address(self):
@@ -165,7 +223,7 @@ log4j.appender.ROLLINGFILE.File=""" + (
     def reset(self):
         """Stop the zookeeper instance, cleaning out its on disk-data."""
         self.stop()
-        shutil.rmtree(os.path.join(self.working_path, "data"))
+        shutil.rmtree(os.path.join(self.working_path, "data"), True)
         os.mkdir(os.path.join(self.working_path, "data"))
         with open(os.path.join(self.working_path, "data", "myid"), "w") as fh:
             fh.write(str(self.server_info.server_id))
@@ -176,6 +234,11 @@ log4j.appender.ROLLINGFILE.File=""" + (
             return
         self.process.terminate()
         self.process.wait()
+        if self.process.returncode != 0:
+            log.warn("Zookeeper process %s failed to terminate with"
+                     " non-zero return code (it terminated with %s return"
+                     " code instead)", self.process.pid,
+                     self.process.returncode)
         self._running = False
 
     def destroy(self):
@@ -184,13 +247,15 @@ log4j.appender.ROLLINGFILE.File=""" + (
         import shutil
         self.stop()
 
-        shutil.rmtree(self.working_path)
+        shutil.rmtree(self.working_path, True)
 
 
 class ZookeeperCluster(object):
 
-    def __init__(self, install_path, size=3, port_offset=20000):
+    def __init__(self, install_path=None, classpath=None,
+                 size=3, port_offset=20000):
         self._install_path = install_path
+        self._classpath = classpath
         self._servers = []
 
         # Calculate ports and peer group
@@ -198,9 +263,9 @@ class ZookeeperCluster(object):
         peers = []
 
         for i in range(size):
-            port += i * 10
-            info = ServerInfo(i + 1, port, port + 1, port + 2)
+            info = ServerInfo(i + 1, port, port + 1, port + 2, port + 3)
             peers.append(info)
+            port += 10
 
         # Instantiate Managed ZK Servers
         for i in range(size):
@@ -208,7 +273,8 @@ class ZookeeperCluster(object):
             server_info = server_peers.pop(i)
             self._servers.append(
                 ManagedZooKeeper(
-                    self._install_path, server_info, server_peers))
+                    self._install_path, server_info, server_peers,
+                    classpath=self._classpath))
 
     def __getitem__(self, k):
         return self._servers[k]

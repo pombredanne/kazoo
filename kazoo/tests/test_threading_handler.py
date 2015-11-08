@@ -2,6 +2,7 @@ import threading
 import unittest
 
 import mock
+from nose.tools import assert_raises
 from nose.tools import eq_
 from nose.tools import raises
 
@@ -105,6 +106,7 @@ class TestThreadingAsync(unittest.TestCase):
         async.set('fred')
         cv.wait()
         eq_(lst, ['fred'])
+        th.join()
 
     def test_get_with_nowait(self):
         mock_handler = mock.Mock()
@@ -145,6 +147,7 @@ class TestThreadingAsync(unittest.TestCase):
         async.set_exception(ImportError)
         cv.wait()
         eq_(lst, ['oops'])
+        th.join()
 
     def test_wait(self):
         mock_handler = mock.Mock()
@@ -170,6 +173,7 @@ class TestThreadingAsync(unittest.TestCase):
         async.set("fred")
         cv.wait(15)
         eq_(lst, [True])
+        th.join()
 
     def test_set_before_wait(self):
         mock_handler = mock.Mock()
@@ -187,6 +191,7 @@ class TestThreadingAsync(unittest.TestCase):
         th.start()
         cv.wait()
         eq_(lst, ['fred'])
+        th.join()
 
     def test_set_exc_before_wait(self):
         mock_handler = mock.Mock()
@@ -208,6 +213,7 @@ class TestThreadingAsync(unittest.TestCase):
         th.start()
         cv.wait()
         eq_(lst, ['ooops'])
+        th.join()
 
     def test_linkage(self):
         mock_handler = mock.Mock()
@@ -232,6 +238,7 @@ class TestThreadingAsync(unittest.TestCase):
         async.unlink(add_on)
         cv.wait()
         eq_(async.value, 'fred')
+        th.join()
 
     def test_linkage_not_ready(self):
         mock_handler = mock.Mock()
@@ -261,3 +268,59 @@ class TestThreadingAsync(unittest.TestCase):
         async.unlink(add_on)
         async.set('fred')
         assert not mock_handler.completion_queue.put.called
+
+    def test_captured_exception(self):
+        from kazoo.handlers.utils import capture_exceptions
+
+        mock_handler = mock.Mock()
+        async = self._makeOne(mock_handler)
+
+        @capture_exceptions(async)
+        def exceptional_function():
+            return 1/0
+
+        exceptional_function()
+
+        assert_raises(ZeroDivisionError, async.get)
+
+    def test_no_capture_exceptions(self):
+        from kazoo.handlers.utils import capture_exceptions
+
+        mock_handler = mock.Mock()
+        async = self._makeOne(mock_handler)
+
+        lst = []
+
+        def add_on():
+            lst.append(True)
+
+        async.rawlink(add_on)
+
+        @capture_exceptions(async)
+        def regular_function():
+            return True
+
+        regular_function()
+
+        assert not mock_handler.completion_queue.put.called
+
+    def test_wraps(self):
+        from kazoo.handlers.utils import wrap
+
+        mock_handler = mock.Mock()
+        async = self._makeOne(mock_handler)
+
+        lst = []
+
+        def add_on(result):
+            lst.append(result.get())
+
+        async.rawlink(add_on)
+
+        @wrap(async)
+        def regular_function():
+            return 'hello'
+
+        assert regular_function() == 'hello'
+        assert mock_handler.completion_queue.put.called
+        assert async.get() == 'hello'

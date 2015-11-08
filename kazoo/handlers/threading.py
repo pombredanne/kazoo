@@ -12,143 +12,40 @@ environments that use threads.
 """
 from __future__ import absolute_import
 
-import atexit
+import errno
 import logging
 import select
 import socket
-import time
 import threading
+import time
+
+import kazoo.python2atexit as python2atexit
 
 try:
     import Queue
 except ImportError:  # pragma: nocover
     import queue as Queue
 
-from zope.interface import implementer
+from kazoo.handlers import utils
 
-from kazoo.handlers.utils import create_tcp_socket
-from kazoo.interfaces import IAsyncResult
-from kazoo.interfaces import IHandler
-
-# sentinal objects
-_NONE = object()
+# sentinel objects
 _STOP = object()
 
 log = logging.getLogger(__name__)
 
 
-class TimeoutError(Exception):
+class KazooTimeoutError(Exception):
     pass
 
 
-@implementer(IAsyncResult)
-class AsyncResult(object):
+class AsyncResult(utils.AsyncResult):
     """A one-time event that stores a value or an exception"""
     def __init__(self, handler):
-        self._handler = handler
-        self.value = None
-        self._exception = _NONE
-        self._condition = threading.Condition()
-        self._callbacks = []
-
-    def ready(self):
-        """Return true if and only if it holds a value or an
-        exception"""
-        return self._exception is not _NONE
-
-    def successful(self):
-        """Return true if and only if it is ready and holds a value"""
-        return self._exception is None
-
-    @property
-    def exception(self):
-        if self._exception is not _NONE:
-            return self._exception
-
-    def set(self, value=None):
-        """Store the value. Wake up the waiters."""
-        with self._condition:
-            self.value = value
-            self._exception = None
-
-            for callback in self._callbacks:
-                self._handler.completion_queue.put(
-                    lambda: callback(self)
-                )
-            self._condition.notify_all()
-
-    def set_exception(self, exception):
-        """Store the exception. Wake up the waiters."""
-        with self._condition:
-            self._exception = exception
-
-            for callback in self._callbacks:
-                self._handler.completion_queue.put(
-                    lambda: callback(self)
-                )
-            self._condition.notify_all()
-
-    def get(self, block=True, timeout=None):
-        """Return the stored value or raise the exception.
-
-        If there is no value raises TimeoutError.
-
-        """
-        with self._condition:
-            if self._exception is not _NONE:
-                if self._exception is None:
-                    return self.value
-                raise self._exception
-            elif block:
-                self._condition.wait(timeout)
-                if self._exception is not _NONE:
-                    if self._exception is None:
-                        return self.value
-                    raise self._exception
-
-            # if we get to this point we timeout
-            raise TimeoutError()
-
-    def get_nowait(self):
-        """Return the value or raise the exception without blocking.
-
-        If nothing is available, raises TimeoutError
-
-        """
-        return self.get(block=False)
-
-    def wait(self, timeout=None):
-        """Block until the instance is ready."""
-        with self._condition:
-            self._condition.wait(timeout)
-        return self._exception is not _NONE
-
-    def rawlink(self, callback):
-        """Register a callback to call when a value or an exception is
-        set"""
-        with self._condition:
-            # Are we already set? Dispatch it now
-            if self.ready():
-                self._handler.completion_queue.put(
-                    lambda: callback(self)
-                )
-                return
-
-            if callback not in self._callbacks:
-                self._callbacks.append(callback)
-
-    def unlink(self, callback):
-        """Remove the callback set by :meth:`rawlink`"""
-        with self._condition:
-            if self.ready():
-                # Already triggered, ignore
-                return
-
-            if callback in self._callbacks:
-                self._callbacks.remove(callback)
+        super(AsyncResult, self).__init__(handler,
+                                          threading.Condition,
+                                          KazooTimeoutError)
 
 
-@implementer(IHandler)
 class SequentialThreadingHandler(object):
     """Threading handler for sequentially executing callbacks.
 
@@ -178,20 +75,21 @@ class SequentialThreadingHandler(object):
 
     """
     name = "sequential_threading_handler"
-    timeout_exception = TimeoutError
-    sleep_func = time.sleep
+    timeout_exception = KazooTimeoutError
+    sleep_func = staticmethod(time.sleep)
+    queue_impl = Queue.Queue
+    queue_empty = Queue.Empty
 
     def __init__(self):
         """Create a :class:`SequentialThreadingHandler` instance"""
-        self.callback_queue = Queue.Queue()
-        self.completion_queue = Queue.Queue()
+        self.callback_queue = self.queue_impl()
+        self.completion_queue = self.queue_impl()
         self._running = False
         self._state_change = threading.Lock()
         self._workers = []
-        atexit.register(self.stop)
 
     def _create_thread_worker(self, queue):
-        def thread_worker():  # pragma: nocover
+        def _thread_worker():  # pragma: nocover
             while True:
                 try:
                     func = queue.get()
@@ -199,20 +97,13 @@ class SequentialThreadingHandler(object):
                         if func is _STOP:
                             break
                         func()
-                    except Exception as exc:
-                        log.warning("Exception in worker queue thread")
-                        log.exception(exc)
+                    except Exception:
+                        log.exception("Exception in worker queue thread")
                     finally:
                         queue.task_done()
-                except Queue.Empty:
+                except self.queue_empty:
                     continue
-        t = threading.Thread(target=thread_worker)
-
-        # Even though these should be joined, its possible stop might
-        # not issue in time so we set them to daemon to let the program
-        # exit anyways
-        t.daemon = True
-        t.start()
+        t = self.spawn(_thread_worker)
         return t
 
     def start(self):
@@ -223,12 +114,12 @@ class SequentialThreadingHandler(object):
 
             # Spawn our worker threads, we have
             # - A callback worker for watch events to be called
-            # - A session worker for session events to be called
             # - A completion worker for completion events to be called
             for queue in (self.completion_queue, self.callback_queue):
                 w = self._create_thread_worker(queue)
                 self._workers.append(w)
             self._running = True
+            python2atexit.register(self.stop)
 
     def stop(self):
         """Stop the worker threads and empty all queues."""
@@ -247,14 +138,31 @@ class SequentialThreadingHandler(object):
                 worker.join()
 
             # Clear the queues
-            self.callback_queue = Queue.Queue()
-            self.completion_queue = Queue.Queue()
+            self.callback_queue = self.queue_impl()
+            self.completion_queue = self.queue_impl()
+            python2atexit.unregister(self.stop)
 
     def select(self, *args, **kwargs):
-        return select.select(*args, **kwargs)
+        try:
+            return select.select(*args, **kwargs)
+        except select.error as ex:
+            # if the system call was interrupted, we'll return as a timeout
+            # in Python 3, system call interruptions are a native exception
+            # in Python 2, they are not
+            errnum = ex.errno if isinstance(ex, OSError) else ex[0]
+            # to mimic a timeout, we return the same thing select would
+            if errnum == errno.EINTR:
+                return ([], [], [])
+            raise
 
     def socket(self):
-        return create_tcp_socket(socket)
+        return utils.create_tcp_socket(socket)
+
+    def create_connection(self, *args, **kwargs):
+        return utils.create_tcp_connection(socket, *args, **kwargs)
+
+    def create_socket_pair(self):
+        return utils.create_socket_pair(socket)
 
     def event_object(self):
         """Create an appropriate Event object"""
@@ -276,6 +184,7 @@ class SequentialThreadingHandler(object):
         t = threading.Thread(target=func, args=args, kwargs=kwargs)
         t.daemon = True
         t.start()
+        return t
 
     def dispatch_callback(self, callback):
         """Dispatch to the callback object

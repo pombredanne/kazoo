@@ -1,13 +1,42 @@
 """Higher level child and data watching API's.
+
+:Maintainer: Ben Bangert <ben@groovie.org>
+:Status: Production
+
+.. note::
+
+    :ref:`DataWatch` and :ref:`ChildrenWatch` may only handle a single
+    function, attempts to associate a single instance with multiple functions
+    will result in an exception being thrown.
+
 """
 import logging
 import time
-from functools import partial
+import warnings
+from functools import partial, wraps
 
-from kazoo.client import KazooState
-from kazoo.exceptions import NoNodeError
+from kazoo.retry import KazooRetry
+from kazoo.exceptions import (
+    ConnectionClosedError,
+    NoNodeError,
+    KazooException
+)
+from kazoo.protocol.states import KazooState
 
 log = logging.getLogger(__name__)
+
+
+_STOP_WATCHING = object()
+
+
+def _ignore_closed(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except ConnectionClosedError:
+            pass
+    return wrapper
 
 
 class DataWatch(object):
@@ -17,8 +46,24 @@ class DataWatch(object):
     The function will also be called the very first time its
     registered to get the data.
 
-    Returning `False` from the registered function will disable
-    future data change calls.
+    Returning `False` from the registered function will disable future
+    data change calls. If the client connection is closed (using the
+    close command), the DataWatch will no longer get updates.
+
+    If the function supplied takes three arguments, then the third one
+    will be a :class:`~kazoo.protocol.states.WatchedEvent`. It will
+    only be set if the change to the data occurs as a result of the
+    server notifying the watch that there has been a change. Events
+    like reconnection or the first call will not include an event.
+
+    If the node does not exist, then the function will be called with
+    ``None`` for all values.
+
+    .. tip::
+
+        Because :class:`DataWatch` can watch nodes that don't exist, it
+        can be used alternatively as a higher-level Exists watcher that
+        survives reconnections and session loss.
 
     Example with client:
 
@@ -26,30 +71,25 @@ class DataWatch(object):
 
         @client.DataWatch('/path/to/watch')
         def my_func(data, stat):
-            print "Data is %s" % data
-            print "Version is %s" % stat.version
+            print("Data is %s" % data)
+            print("Version is %s" % stat.version)
 
         # Above function is called immediately and prints
 
-        # If allow_missing_node=True then 'data'
-        # will always be None.
+        # Or if you want the event object
+        @client.DataWatch('/path/to/watch')
+        def my_func(data, stat, event):
+            print("Data is %s" % data)
+            print("Version is %s" % stat.version)
+            print("Event is %s" % event)
 
-    If allow_missing_node=False in __init__, then in the
-    event the node does not exist, the function will be called with
-    ``(None, None)`` and will not be called again. This should be
-    considered the last function call. This behavior will also occur
-    if the node is deleted.
+    .. versionchanged:: 1.2
 
-    If allow_missing_node=True in __init__, then in the
-    event the node does not exist, the function will be called with
-    ``(None, None)`` and it will later be called again if the node is
-    recreated. In the event the node exists and is later deleted, the
-    function will be called with ``(None, None)`` and it will later
-    be called if the node is recreated.
+        DataWatch now ignores additional arguments that were previously
+        passed to it and warns that they are no longer respected.
 
     """
-    def __init__(self, client, path, func=None,
-                 allow_session_lost=True, allow_missing_node=False):
+    def __init__(self, client, path, func=None, *args, **kwargs):
         """Create a data watcher for a path
 
         :param client: A zookeeper client.
@@ -61,33 +101,32 @@ class DataWatch(object):
                      tuple, the value of the node and a
                      :class:`~kazoo.client.ZnodeStat` instance.
         :type func: callable
-        :param allow_session_lost: Whether the watch should be
-                                   re-registered if the zookeeper
-                                   session is lost.
-        :type allow_session_lost: bool
-        :param allow_missing_node:
-            Allow the mode to be missing when the watch is initially
-            set.
-
-        The path must already exist for the data watcher to
-        run.
 
         """
         self._client = client
         self._path = path
         self._func = func
         self._stopped = False
-        self._watch_established = False
-        self._allow_session_lost = allow_session_lost
-        self._allow_missing_node = allow_missing_node
         self._run_lock = client.handler.lock_object()
-        self._prior_data = ()
+        self._version = None
+        self._retry = KazooRetry(max_tries=None,
+                                 sleep_func=client.handler.sleep_func)
+        self._include_event = None
+        self._ever_called = False
+        self._used = False
+
+        if args or kwargs:
+            warnings.warn('Passing additional arguments to DataWatch is'
+                          ' deprecated. ignore_missing_node is now assumed '
+                          ' to be True by default, and the event will be '
+                          ' sent if the function can handle receiving it',
+                          DeprecationWarning, stacklevel=2)
 
         # Register our session listener if we're going to resume
         # across session losses
-        if func:
-            if allow_session_lost:
-                self._client.add_listener(self._session_watcher)
+        if func is not None:
+            self._used = True
+            self._client.add_listener(self._session_watcher)
             self._get_data()
 
     def __call__(self, func):
@@ -100,90 +139,79 @@ class DataWatch(object):
         :type func: callable
 
         """
+        if self._used:
+            raise KazooException(
+                "A function has already been associated with this "
+                "DataWatch instance.")
+
         self._func = func
 
-        if self._allow_session_lost:
-            self._client.add_listener(self._session_watcher)
+        self._used = True
+        self._client.add_listener(self._session_watcher)
         self._get_data()
         return func
 
-    def _get_data(self, using_exists=False):
-        with self._run_lock:  # Ensure this runs one at a time
-            if using_exists and self._prior_data:
-                # We were able to get data after the first exists
-                # check, abort _get_data since there's a separate
-                # watcher for it now
-                return
+    def _log_func_exception(self, data, stat, event=None):
+        try:
+            # For backwards compatibility, don't send event to the
+            # callback unless the send_event is set in constructor
+            if not self._ever_called:
+                self._ever_called = True
+            try:
+                result = self._func(data, stat, event)
+            except TypeError:
+                result = self._func(data, stat)
+            if result is False:
+                self._stopped = True
+                self._client.remove_listener(self._session_watcher)
+        except Exception as exc:
+            log.exception(exc)
+            raise
 
+    @_ignore_closed
+    def _get_data(self, event=None):
+        # Ensure this runs one at a time, possible because the session
+        # watcher may trigger a run
+        with self._run_lock:
             if self._stopped:
                 return
 
-            try:
-                data, stat = self._client.retry(self._client.get,
-                                                self._path, self._watcher)
-            except NoNodeError:
-                if self._allow_missing_node:
-                    data = None
+            initial_version = self._version
 
-                    # This will set 'stat' to None if the node does not yet
-                    # exist.
-                    stat = self._client.retry(self._client.exists,
-                                              self._path, self._exists_watcher)
-                    if stat:
-                        # Apparently the node now exists... try again
-                        data, stat = self._client.retry(
-                            self._client.get, self._path, self._watcher)
-                    else:
-                        # We return here, to ensure we don't indicate
-                        # there was prior data
-                        if self._func(data, stat) is False:
-                            self._stopped = True
-                        return
-                else:
-                    # This can only happen if _allow_missing_node
-                    # is False, because when it is True we use the
-                    # ZK 'retry' method, which can't have this exception.
-                    self._stopped = True
-                    self._func(None, None)
+            try:
+                data, stat = self._retry(self._client.get,
+                                         self._path, self._watcher)
+            except NoNodeError:
+                data = None
+
+                # This will set 'stat' to None if the node does not yet
+                # exist.
+                stat = self._retry(self._client.exists, self._path,
+                                   self._watcher)
+                if stat:
+                    self._client.handler.spawn(self._get_data)
                     return
 
-            if not self._watch_established:
-                self._watch_established = True
+            # No node data, clear out version
+            if stat is None:
+                self._version = None
+            else:
+                self._version = stat.mzxid
 
-                # If we had data and it hasn't changed, this is a session
-                # re-establishment and nothing changed, so don't call the func
-                if self._prior_data:
-                    # If the prior session had no data, then it was
-                    # watching a node that did not exist.
-                    if self._prior_data[1] is None:
-                        # If the current session also has no data, then don't
-                        # call the func, since nothing has changed.
-                        if stat is None:
-                            return
-                    elif stat is not None and \
-                         self._prior_data[1].mzxid == stat.mzxid:
-                        return
-
-            self._prior_data = data, stat
-
-            try:
-                if self._func(data, stat) is False:
-                    self._stopped = True
-            except Exception as exc:
-                log.exception(exc)
-                raise
+            # Call our function if its the first time ever, or if the
+            # version has changed
+            if initial_version != self._version or not self._ever_called:
+                self._log_func_exception(data, stat, event)
 
     def _watcher(self, event):
-        self._get_data()
+        self._get_data(event=event)
 
-    def _exists_watcher(self, event):
-        self._get_data(using_exists=True)
+    def _set_watch(self, state):
+        with self._run_lock:
+            self._watch_established = state
 
     def _session_watcher(self, state):
-        if state in (KazooState.LOST, KazooState.SUSPENDED):
-            self._watch_established = False
-        elif state == KazooState.CONNECTED and \
-             not self._watch_established and not self._stopped:
+        if state == KazooState.CONNECTED:
             self._client.handler.spawn(self._get_data)
 
 
@@ -194,8 +222,15 @@ class ChildrenWatch(object):
     The function will also be called the very first time its
     registered to get children.
 
-    Returning `False` from the registered function will disable
-    future children change calls.
+    Returning `False` from the registered function will disable future
+    children change calls. If the client connection is closed (using
+    the close command), the ChildrenWatch will no longer get updates.
+
+    if send_event=True in __init__, then the function will always be
+    called with second parameter, ``event``. Upon initial call or when
+    recovering a lost session the ``event`` is always ``None``.
+    Otherwise it's a :class:`~kazoo.prototype.state.WatchedEvent`
+    instance.
 
     Example with client:
 
@@ -209,7 +244,7 @@ class ChildrenWatch(object):
 
     """
     def __init__(self, client, path, func=None,
-                 allow_session_lost=True):
+                 allow_session_lost=True, send_event=False):
         """Create a children watcher for a path
 
         :param client: A zookeeper client.
@@ -224,6 +259,10 @@ class ChildrenWatch(object):
                                    re-registered if the zookeeper
                                    session is lost.
         :type allow_session_lost: bool
+        :type send_event: bool
+        :param send_event: Whether the function should be passed the
+                           event sent by ZooKeeper or None upon
+                           initialization (see class documentation)
 
         The path must already exist for the children watcher to
         run.
@@ -232,15 +271,18 @@ class ChildrenWatch(object):
         self._client = client
         self._path = path
         self._func = func
+        self._send_event = send_event
         self._stopped = False
         self._watch_established = False
         self._allow_session_lost = allow_session_lost
         self._run_lock = client.handler.lock_object()
         self._prior_children = None
+        self._used = False
 
         # Register our session listener if we're going to resume
         # across session losses
-        if func:
+        if func is not None:
+            self._used = True
             if allow_session_lost:
                 self._client.add_listener(self._session_watcher)
             self._get_children()
@@ -254,14 +296,21 @@ class ChildrenWatch(object):
         :type func: callable
 
         """
+        if self._used:
+            raise KazooException(
+                "A function has already been associated with this "
+                "ChildrenWatch instance.")
+
         self._func = func
 
+        self._used = True
         if self._allow_session_lost:
             self._client.add_listener(self._session_watcher)
         self._get_children()
         return func
 
-    def _get_children(self):
+    @_ignore_closed
+    def _get_children(self, event=None):
         with self._run_lock:  # Ensure this runs one at a time
             if self._stopped:
                 return
@@ -278,20 +327,24 @@ class ChildrenWatch(object):
             self._prior_children = children
 
             try:
-                if self._func(children) is False:
+                if self._send_event:
+                    result = self._func(children, event)
+                else:
+                    result = self._func(children)
+                if result is False:
                     self._stopped = True
             except Exception as exc:
                 log.exception(exc)
                 raise
 
     def _watcher(self, event):
-        self._get_children()
+        self._get_children(event)
 
     def _session_watcher(self, state):
         if state in (KazooState.LOST, KazooState.SUSPENDED):
             self._watch_established = False
-        elif state == KazooState.CONNECTED and \
-             not self._watch_established and not self._stopped:
+        elif (state == KazooState.CONNECTED and
+              not self._watch_established and not self._stopped):
             self._client.handler.spawn(self._get_children)
 
 

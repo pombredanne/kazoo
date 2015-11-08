@@ -1,22 +1,35 @@
-import atexit
-import os
+import socket
 import sys
 import threading
 import time
 import uuid
 import unittest
 
+import mock
+from mock import patch
 from nose import SkipTest
 from nose.tools import eq_
 from nose.tools import raises
 
 from kazoo.testing import KazooTestCase
-from kazoo.exceptions import BadArgumentsError
-from kazoo.exceptions import ConfigurationError
-from kazoo.exceptions import InvalidACLError
-from kazoo.exceptions import NoNodeError
-from kazoo.exceptions import NoAuthError
-from kazoo.exceptions import ConnectionLoss
+from kazoo.exceptions import (
+    AuthFailedError,
+    BadArgumentsError,
+    BadVersionError,
+    ConfigurationError,
+    ConnectionClosedError,
+    ConnectionLoss,
+    InvalidACLError,
+    NoAuthError,
+    NoNodeError,
+    NodeExistsError,
+    SessionExpiredError,
+    KazooException,
+)
+from kazoo.protocol.connection import _CONNECTION_DROP
+from kazoo.protocol.states import KeeperState, KazooState
+from kazoo.tests.util import TRAVIS_ZK_VERSION
+
 
 if sys.version_info > (3, ):  # pragma: nocover
     def u(s):
@@ -26,51 +39,12 @@ else:  # pragma: nocover
         return unicode(s, "unicode_escape")
 
 
-class TestSessions(unittest.TestCase):
-
-    def setUp(self):
-        from kazoo.client import KazooClient
-        from kazoo.protocol.states import KazooState
-        from kazoo.testing.common import ZookeeperCluster
-        ZK_HOME = os.environ.get("ZOOKEEPER_PATH")
-        self.cluster = ZookeeperCluster(ZK_HOME, size=1, port_offset=21000)
-        self.cluster.start()
-        atexit.register(lambda cluster: self.cluster.terminate(), self.cluster)
-        self.client = KazooClient(self.cluster[0].address, max_retries=5)
-        self.ev = threading.Event()
-
-        def back(state):
-            if state == KazooState.CONNECTED:
-                self.ev.set()
-        self.client.start()
-        self.path = self.client.create(uuid.uuid4().hex)
-        self.client.add_listener(back)
-
-    def test_restarted_server(self):
-        raise SkipTest('Patch missing')
-        self.cluster.stop()
-        self.cluster.start()
-        self.ev.wait(5)
-        eq_(self.ev.is_set(), True)
-        self.assertTrue(self.client.retry(self.client.exists, self.path))
-
-    def test_terminated_server(self):
-        raise SkipTest('Patch missing')
-        self.cluster.reset()
-        self.cluster.start()
-        self.ev.wait(5)
-        eq_(self.ev.is_set(), True)
-        self.assertFalse(self.client.retry(self.client.exists, self.path))
-
-    def tearDown(self):
-        self.ev.clear()
-        self.client.stop()
-        self.cluster.stop()
-
-
 class TestClientTransitions(KazooTestCase):
+    @staticmethod
+    def make_event():
+        return threading.Event()
+
     def test_connection_and_disconnection(self):
-        from kazoo.client import KazooState
         states = []
         rc = threading.Event()
 
@@ -89,16 +63,10 @@ class TestClientTransitions(KazooTestCase):
         eq_(states, [KazooState.CONNECTED])
         rc.clear()
         states.pop()
-        self.expire_session()
+        self.expire_session(self.make_event)
         rc.wait(2)
 
-        # Depending on timings, its possible during session expiration
-        # that the client gets one connection in before being dropped
-        req_states = [KazooState.SUSPENDED, KazooState.LOST,
-                     KazooState.CONNECTED]
-        if len(states) == 5:
-            req_states = [KazooState.SUSPENDED, KazooState.CONNECTED] \
-                 + req_states
+        req_states = [KazooState.LOST, KazooState.CONNECTED]
         eq_(states, req_states)
 
 
@@ -110,7 +78,8 @@ class TestClientConstructor(unittest.TestCase):
 
     def test_invalid_handler(self):
         from kazoo.handlers.threading import SequentialThreadingHandler
-        self.assertRaises(ConfigurationError,
+        self.assertRaises(
+            ConfigurationError,
             self._makeOne, handler=SequentialThreadingHandler)
 
     def test_chroot(self):
@@ -122,14 +91,14 @@ class TestClientConstructor(unittest.TestCase):
             hosts='127.0.0.1:2181,127.0.0.1:2182/a/b').chroot, '/a/b')
 
     def test_connection_timeout(self):
-        from kazoo.handlers.threading import TimeoutError
+        from kazoo.handlers.threading import KazooTimeoutError
         client = self._makeOne(hosts='127.0.0.1:9')
-        self.assertTrue(client.handler.timeout_exception is TimeoutError)
-        self.assertRaises(TimeoutError, client.start, 0.1)
+        self.assertTrue(client.handler.timeout_exception is KazooTimeoutError)
+        self.assertRaises(KazooTimeoutError, client.start, 0.1)
 
     def test_ordered_host_selection(self):
         client = self._makeOne(hosts='127.0.0.1:9,127.0.0.2:9/a',
-            randomize_hosts=False)
+                               randomize_hosts=False)
         hosts = [h for h in client.hosts]
         eq_(hosts, [('127.0.0.1', 9), ('127.0.0.2', 9)])
 
@@ -138,8 +107,23 @@ class TestClientConstructor(unittest.TestCase):
         timeout = client.handler.timeout_exception
         self.assertRaises(timeout, client.start, 0.1)
 
+    def test_another_invalid_hostname(self):
+        self.assertRaises(
+            ValueError,
+            self._makeOne, hosts='/nosuchhost/a')
 
-class TestConnection(KazooTestCase):
+    def test_retry_options_dict(self):
+        from kazoo.retry import KazooRetry
+        client = self._makeOne(command_retry=dict(max_tries=99),
+                               connection_retry=dict(delay=99))
+        self.assertTrue(type(client._conn_retry) is KazooRetry)
+        self.assertTrue(type(client._retry) is KazooRetry)
+        eq_(client._retry.max_tries, 99)
+        eq_(client._conn_retry.delay, 99)
+
+
+class TestAuthentication(KazooTestCase):
+
     def _makeAuth(self, *args, **kwargs):
         from kazoo.security import make_digest_acl
         return make_digest_acl(*args, **kwargs)
@@ -151,13 +135,15 @@ class TestConnection(KazooTestCase):
         digest_auth = "%s:%s" % (username, password)
         acl = self._makeAuth(username, password, all=True)
 
-        self.client.add_auth("digest", digest_auth)
-        self.client.default_acl = (acl,)
+        client = self._get_client()
+        client.start()
+        client.add_auth("digest", digest_auth)
+        client.default_acl = (acl,)
 
         try:
-            self.client.create("/1")
-            self.client.create("/1/2")
-            self.client.ensure_path("/1/2/3")
+            client.create("/1")
+            client.create("/1/2")
+            client.ensure_path("/1/2/3")
 
             eve = self._get_client()
             eve.start()
@@ -170,7 +156,9 @@ class TestConnection(KazooTestCase):
             self.assertRaises(NoAuthError, eve.get, "/1/2")
         finally:
             # Ensure we remove the ACL protected nodes
-            self.client.delete("/1", recursive=True)
+            client.delete("/1", recursive=True)
+            eve.stop()
+            eve.close()
 
     def test_connect_auth(self):
         username = uuid.uuid4().hex
@@ -189,6 +177,7 @@ class TestConnection(KazooTestCase):
         finally:
             client.delete('/1')
             client.stop()
+            client.close()
 
     def test_unicode_auth(self):
         username = u("xe4/\hm")
@@ -196,12 +185,14 @@ class TestConnection(KazooTestCase):
         digest_auth = "%s:%s" % (username, password)
         acl = self._makeAuth(username, password, all=True)
 
-        self.client.add_auth("digest", digest_auth)
-        self.client.default_acl = (acl,)
+        client = self._get_client()
+        client.start()
+        client.add_auth("digest", digest_auth)
+        client.default_acl = (acl,)
 
         try:
-            self.client.create("/1")
-            self.client.ensure_path("/1/2/3")
+            client.create("/1")
+            client.ensure_path("/1/2/3")
 
             eve = self._get_client()
             eve.start()
@@ -214,33 +205,85 @@ class TestConnection(KazooTestCase):
             self.assertRaises(NoAuthError, eve.get, "/1/2")
         finally:
             # Ensure we remove the ACL protected nodes
-            self.client.delete("/1", recursive=True)
+            client.delete("/1", recursive=True)
+            eve.stop()
+            eve.close()
 
     def test_invalid_auth(self):
-        self.assertRaises(TypeError, self.client.add_auth,
-            'digest', ('user', 'pass'))
-        self.assertRaises(TypeError, self.client.add_auth,
-            None, ('user', 'pass'))
+        client = self._get_client()
+        client.start()
+        self.assertRaises(TypeError, client.add_auth,
+                          'digest', ('user', 'pass'))
+        self.assertRaises(TypeError, client.add_auth,
+                          None, ('user', 'pass'))
+
+    def test_async_auth(self):
+        client = self._get_client()
+        client.start()
+        username = uuid.uuid4().hex
+        password = uuid.uuid4().hex
+        digest_auth = "%s:%s" % (username, password)
+        result = client.add_auth_async("digest", digest_auth)
+        self.assertTrue(result.get())
+
+    def test_async_auth_failure(self):
+        client = self._get_client()
+        client.start()
+        username = uuid.uuid4().hex
+        password = uuid.uuid4().hex
+        digest_auth = "%s:%s" % (username, password)
+
+        self.assertRaises(AuthFailedError, client.add_auth,
+                          "unknown-scheme", digest_auth)
+
+    def test_add_auth_on_reconnect(self):
+        client = self._get_client()
+        client.start()
+        client.add_auth("digest", "jsmith:jsmith")
+        client._connection._socket.shutdown(socket.SHUT_RDWR)
+        while not client.connected:
+            time.sleep(0.1)
+        self.assertTrue(("digest", "jsmith:jsmith") in client.auth_data)
+
+
+class TestConnection(KazooTestCase):
+    @staticmethod
+    def make_event():
+        return threading.Event()
+
+    @staticmethod
+    def make_condition():
+        return threading.Condition()
+
+    def test_chroot_warning(self):
+        k = self._get_nonchroot_client()
+        k.chroot = 'abba'
+        try:
+            with patch('warnings.warn') as mock_func:
+                k.start()
+                assert mock_func.called
+        finally:
+            k.stop()
 
     def test_session_expire(self):
         from kazoo.protocol.states import KazooState
 
-        cv = threading.Event()
+        cv = self.make_event()
 
         def watch_events(event):
             if event == KazooState.LOST:
                 cv.set()
 
         self.client.add_listener(watch_events)
-        self.expire_session()
+        self.expire_session(self.make_event)
         cv.wait(3)
         assert cv.is_set()
 
     def test_bad_session_expire(self):
         from kazoo.protocol.states import KazooState
 
-        cv = threading.Event()
-        ab = threading.Event()
+        cv = self.make_event()
+        ab = self.make_event()
 
         def watch_events(event):
             if event == KazooState.LOST:
@@ -249,7 +292,7 @@ class TestConnection(KazooTestCase):
                 cv.set()
 
         self.client.add_listener(watch_events)
-        self.expire_session()
+        self.expire_session(self.make_event)
         ab.wait(0.5)
         assert ab.is_set()
         cv.wait(0.5)
@@ -258,7 +301,7 @@ class TestConnection(KazooTestCase):
     def test_state_listener(self):
         from kazoo.protocol.states import KazooState
         states = []
-        condition = threading.Condition()
+        condition = self.make_condition()
 
         def listener(state):
             with condition:
@@ -284,7 +327,7 @@ class TestConnection(KazooTestCase):
         from kazoo.protocol.states import KazooState
         self.assertTrue(self.client.state, KazooState.CONNECTED)
         called = [False]
-        condition = threading.Event()
+        condition = self.make_event()
 
         def listener(state):
             called[0] = True
@@ -296,12 +339,36 @@ class TestConnection(KazooTestCase):
         self.assertFalse(called[0])
 
     def test_no_connection(self):
-        from kazoo.exceptions import SessionExpiredError
         client = self.client
         client.stop()
         self.assertFalse(client.connected)
         self.assertTrue(client.client_id is None)
-        self.assertRaises(SessionExpiredError, client.exists, '/')
+        self.assertRaises(ConnectionClosedError, client.exists, '/')
+
+    def test_close_connecting_connection(self):
+        client = self.client
+        client.stop()
+        ev = self.make_event()
+
+        def close_on_connecting(state):
+            if state in (KazooState.CONNECTED, KazooState.LOST):
+                ev.set()
+
+        client.add_listener(close_on_connecting)
+        client.start()
+
+        # Wait until we connect
+        ev.wait(5)
+        ev.clear()
+        self.client._call(_CONNECTION_DROP, client.handler.async_result())
+
+        client.stop()
+
+        # ...and then wait until the connection is lost
+        ev.wait(5)
+
+        self.assertRaises(ConnectionClosedError,
+                          self.client.create, '/foobar')
 
     def test_double_start(self):
         self.assertTrue(self.client.connected)
@@ -319,11 +386,68 @@ class TestConnection(KazooTestCase):
         self.client.restart()
         self.assertTrue(self.client.connected)
 
+    def test_closed(self):
+        client = self.client
+        client.stop()
+
+        write_sock = client._connection._write_sock
+
+        # close the connection to free the socket
+        client.close()
+        eq_(client._connection._write_sock, None)
+
+        # sneak in and patch client to simulate race between a thread
+        # calling stop(); close() and one running a command
+        oldstate = client._state
+        client._state = KeeperState.CONNECTED
+        client._connection._write_sock = write_sock
+        try:
+            # simulate call made after write socket is closed
+            self.assertRaises(ConnectionClosedError, client.exists, '/')
+
+            # simulate call made after write socket is set to None
+            client._connection._write_sock = None
+            self.assertRaises(ConnectionClosedError, client.exists, '/')
+
+        finally:
+            # reset for teardown
+            client._state = oldstate
+            client._connection._write_sock = None
+
 
 class TestClient(KazooTestCase):
+    def _makeOne(self, *args):
+        from kazoo.handlers.threading import SequentialThreadingHandler
+        return SequentialThreadingHandler(*args)
+
     def _getKazooState(self):
         from kazoo.protocol.states import KazooState
         return KazooState
+
+    def test_server_version_retries_fail(self):
+        client = self.client
+        side_effects = [
+            '',
+            'zookeeper.version=',
+            'zookeeper.version=1.',
+            'zookeeper.ver',
+        ]
+        client.command = mock.MagicMock()
+        client.command.side_effect = side_effects
+        self.assertRaises(KazooException,
+                          client.server_version,
+                          retries=len(side_effects) - 1)
+
+    def test_server_version_retries_eventually_ok(self):
+        client = self.client
+        actual_version = 'zookeeper.version=1.2'
+        side_effects = []
+        for i in range(0, len(actual_version) + 1):
+            side_effects.append(actual_version[0:i])
+        client.command = mock.MagicMock()
+        client.command.side_effect = side_effects
+        self.assertEqual((1, 2),
+                         client.server_version(retries=len(side_effects) - 1))
 
     def test_client_id(self):
         client_id = self.client.client_id
@@ -341,12 +465,50 @@ class TestClient(KazooTestCase):
         eq_(path, "/1")
         self.assertTrue(client.exists("/1"))
 
+    def test_create_on_broken_connection(self):
+        client = self.client
+        client.start()
+
+        client._state = KeeperState.EXPIRED_SESSION
+        self.assertRaises(SessionExpiredError, client.create,
+                          '/closedpath', b'bar')
+
+        client._state = KeeperState.AUTH_FAILED
+        self.assertRaises(AuthFailedError, client.create,
+                          '/closedpath', b'bar')
+
+        client._state = KeeperState.CONNECTING
+        self.assertRaises(SessionExpiredError, client.create,
+                          '/closedpath', b'bar')
+        client.stop()
+        client.close()
+
+        self.assertRaises(ConnectionClosedError, client.create,
+                          '/closedpath', b'bar')
+
+    def test_create_null_data(self):
+        client = self.client
+        client.create("/nulldata", None)
+        value, _ = client.get("/nulldata")
+        self.assertEqual(value, None)
+
+    def test_create_empty_string(self):
+        client = self.client
+        client.create("/empty", b"")
+        value, _ = client.get("/empty")
+        eq_(value, b"")
+
     def test_create_unicode_path(self):
         client = self.client
         path = client.create(u("/ascii"))
         eq_(path, u("/ascii"))
         path = client.create(u("/\xe4hm"))
         eq_(path, u("/\xe4hm"))
+
+    def test_create_async_returns_unchrooted_path(self):
+        client = self.client
+        path = client.create_async('/1').get()
+        eq_(path, "/1")
 
     def test_create_invalid_path(self):
         client = self.client
@@ -365,6 +527,7 @@ class TestClient(KazooTestCase):
         self.assertRaises(TypeError, client.create, 'a', value=['a'])
         self.assertRaises(TypeError, client.create, 'a', ephemeral='yes')
         self.assertRaises(TypeError, client.create, 'a', sequence='yes')
+        self.assertRaises(TypeError, client.create, 'a', makepath='yes')
 
     def test_create_value(self):
         client = self.client
@@ -391,8 +554,18 @@ class TestClient(KazooTestCase):
         client.create("/1", acl=[single_acl, single_acl])
         acls, stat = client.get_acls("/1")
         # ZK >3.4 removes duplicate ACL entries
-        version = client.server_version()
+        if TRAVIS_ZK_VERSION:
+            version = TRAVIS_ZK_VERSION
+        else:
+            version = client.server_version()
         self.assertEqual(len(acls), 1 if version > (3, 4) else 2)
+
+    def test_create_acl_empty_list(self):
+        from kazoo.security import OPEN_ACL_UNSAFE
+        client = self.client
+        client.create("/1", acl=[])
+        acls, stat = client.get_acls("/1")
+        self.assertEqual(acls, OPEN_ACL_UNSAFE)
 
     def test_version_no_connection(self):
         @raises(ConnectionLoss)
@@ -419,9 +592,9 @@ class TestClient(KazooTestCase):
         client = self.client
         client.create("/1", b"ephemeral", ephemeral=True)
         self.assertRaises(NoChildrenForEphemeralsError,
-            client.create, "/1/2", b"val1")
+                          client.create, "/1/2", b"val1")
         self.assertRaises(NoChildrenForEphemeralsError,
-            client.create, "/1/2", b"val1", ephemeral=True)
+                          client.create, "/1/2", b"val1", ephemeral=True)
 
     def test_create_sequence(self):
         client = self.client
@@ -430,11 +603,13 @@ class TestClient(KazooTestCase):
         eq_(path, "/folder/a0000000000")
         path2 = client.create("/folder/a", b"sequence", sequence=True)
         eq_(path2, "/folder/a0000000001")
+        path3 = client.create("/folder/", b"sequence", sequence=True)
+        eq_(path3, "/folder/0000000002")
 
     def test_create_ephemeral_sequence(self):
         basepath = "/" + uuid.uuid4().hex
-        realpath = self.client.create(basepath, b"sandwich", sequence=True,
-            ephemeral=True)
+        realpath = self.client.create(basepath, b"sandwich",
+                                      sequence=True, ephemeral=True)
         self.assertTrue(basepath != realpath and realpath.startswith(basepath))
         data, stat = self.client.get(realpath)
         eq_(data, b"sandwich")
@@ -448,10 +623,36 @@ class TestClient(KazooTestCase):
         data, stat = self.client.get("/1/2/3/4/5")
         eq_(data, b"val2")
 
+        self.assertRaises(NodeExistsError, self.client.create,
+                          "/1/2/3/4/5", b"val2", makepath=True)
+
+    def test_create_makepath_incompatible_acls(self):
+        from kazoo.client import KazooClient
+        from kazoo.security import make_digest_acl_credential, CREATOR_ALL_ACL
+        credential = make_digest_acl_credential("username", "password")
+        alt_client = KazooClient(
+            self.cluster[0].address + self.client.chroot,
+            max_retries=5, auth_data=[("digest", credential)],
+            handler=self._makeOne())
+        alt_client.start()
+        alt_client.create("/1/2", b"val2", makepath=True, acl=CREATOR_ALL_ACL)
+
+        try:
+            self.assertRaises(NoAuthError, self.client.create,
+                              "/1/2/3/4/5", b"val2", makepath=True)
+        finally:
+            alt_client.delete('/', recursive=True)
+            alt_client.stop()
+
     def test_create_no_makepath(self):
-        self.assertRaises(NoNodeError, self.client.create, "/1/2", b"val1")
-        self.assertRaises(NoNodeError, self.client.create, "/1/2", b"val1",
-            makepath=False)
+        self.assertRaises(NoNodeError, self.client.create,
+                          "/1/2", b"val1")
+        self.assertRaises(NoNodeError, self.client.create,
+                          "/1/2", b"val1", makepath=False)
+
+        self.client.create("/1/2", b"val1", makepath=True)
+        self.assertRaises(NoNodeError, self.client.create,
+                          "/1/2/3/4", b"val1", makepath=False)
 
     def test_create_exists(self):
         from kazoo.exceptions import NodeExistsError
@@ -621,6 +822,20 @@ class TestClient(KazooTestCase):
         self.assertEqual(data, b'second')
         self.assertEqual(stat, stat2)
 
+    def test_set_null_data(self):
+        client = self.client
+        client.create("/nulldata", b"not none")
+        client.set("/nulldata", None)
+        value, _ = client.get("/nulldata")
+        self.assertEqual(value, None)
+
+    def test_set_empty_string(self):
+        client = self.client
+        client.create("/empty", b"not empty")
+        client.set("/empty", b"")
+        value, _ = client.get("/empty")
+        eq_(value, b"")
+
     def test_set_invalid_arguments(self):
         client = self.client
         client.create('a', b'first')
@@ -680,7 +895,7 @@ class TestClient(KazooTestCase):
         client = self.client
         self.assertRaises(NoNodeError, client.get_children, '/none')
         self.assertRaises(NoNodeError, client.get_children,
-            '/none', include_data=True)
+                          '/none', include_data=True)
 
     def test_get_children_invalid_path(self):
         client = self.client
@@ -691,7 +906,7 @@ class TestClient(KazooTestCase):
         self.assertRaises(TypeError, client.get_children, ('a', 'b'))
         self.assertRaises(TypeError, client.get_children, 'a', watch=True)
         self.assertRaises(TypeError, client.get_children,
-            'a', include_data='yes')
+                          'a', include_data='yes')
 
     def test_invalid_auth(self):
         from kazoo.exceptions import AuthFailedError
@@ -706,17 +921,32 @@ class TestClient(KazooTestCase):
             client.get('/')
         testit()
 
-    def test_bad_safeclose(self):
-        client = self.client
-
-        @raises(Exception)
-        def testit():
-            client._safe_close()
-        testit()
-
     def test_client_state(self):
         from kazoo.protocol.states import KeeperState
         eq_(self.client.client_state, KeeperState.CONNECTED)
+
+    def test_update_host_list(self):
+        from kazoo.client import KazooClient
+        from kazoo.protocol.states import KeeperState
+        hosts = self.cluster[0].address
+        # create a client with only one server in its list
+        client = KazooClient(hosts=hosts)
+        client.start()
+
+        # try to change the chroot, not currently allowed
+        self.assertRaises(ConfigurationError,
+                          client.set_hosts, hosts + '/new_chroot')
+
+        # grow the cluster to 3
+        client.set_hosts(self.servers)
+
+        # shut down the first host
+        try:
+            self.cluster[0].stop()
+            time.sleep(5)
+            eq_(client.client_state, KeeperState.CONNECTED)
+        finally:
+            self.cluster[0].run()
 
 
 dummy_dict = {
@@ -727,11 +957,20 @@ dummy_dict = {
 
 
 class TestClientTransactions(KazooTestCase):
+
     def setUp(self):
         KazooTestCase.setUp(self)
-        ver = self.client.server_version()
-        if ver[1] < 4:
-            raise SkipTest("Must use zookeeper 3.4 or above")
+        skip = False
+        if TRAVIS_ZK_VERSION and TRAVIS_ZK_VERSION < (3, 4):
+            skip = True
+        elif TRAVIS_ZK_VERSION and TRAVIS_ZK_VERSION >= (3, 4):
+            skip = False
+        else:
+            ver = self.client.server_version()
+            if ver[1] < 4:
+                skip = True
+        if skip:
+            raise SkipTest("Must use Zookeeper 3.4 or above")
 
     def test_basic_create(self):
         t = self.client.transaction()
@@ -909,3 +1148,57 @@ class TestNonChrootClient(KazooTestCase):
         client.chroot = '/a'
         self.assertEquals(client.unchroot('/a/b'), '/b')
         self.assertEquals(client.unchroot('/b/c'), '/b/c')
+
+
+class TestReconfig(KazooTestCase):
+
+    def setUp(self):
+        KazooTestCase.setUp(self)
+        if TRAVIS_ZK_VERSION:
+            version = TRAVIS_ZK_VERSION
+        else:
+            version = self.client.server_version()
+        if not version or version < (3, 5):
+            raise SkipTest("Must use Zookeeper 3.5 or above")
+
+    def test_add_remove_observer(self):
+        def free_sock_port():
+            s = socket.socket()
+            s.bind(('', 0))
+            return s, s.getsockname()[1]
+
+        # get ports for election, zab and client endpoints. we need to use
+        # ports for which we'd immediately get a RST upon connect(); otherwise
+        # the cluster could crash if it gets a SocketTimeoutException:
+        # https://issues.apache.org/jira/browse/ZOOKEEPER-2202
+        s1, port1 = free_sock_port()
+        s2, port2 = free_sock_port()
+        s3, port3 = free_sock_port()
+
+        joining = 'server.100=0.0.0.0:%d:%d:observer;0.0.0.0:%d' % (
+            port1, port2, port3)
+        data, _ = self.client.reconfig(joining=joining,
+                                       leaving=None,
+                                       new_members=None)
+        self.assertIn(joining, data)
+
+        data, _ = self.client.reconfig(joining=None,
+                                       leaving='100',
+                                       new_members=None)
+        self.assertNotIn(joining, data)
+
+        # try to add it again, but a config number in the future
+        curver = int(data.split('\n')[-1].split('=')[1], base=16)
+        self.assertRaises(BadVersionError,
+                          self.client.reconfig,
+                          joining=joining,
+                          leaving=None,
+                          new_members=None,
+                          from_config=curver + 1)
+
+    def test_bad_input(self):
+        self.assertRaises(BadArgumentsError,
+                          self.client.reconfig,
+                          joining='some thing',
+                          leaving=None,
+                          new_members=None)

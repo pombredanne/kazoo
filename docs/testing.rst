@@ -15,6 +15,14 @@ need to specify an environment variable called `ZOOKEEPER_PATH` and point it
 to their location, for example `/usr/share/java`. The directory should contain
 a `zookeeper-*.jar` and a `lib` directory containing at least a `log4j-*.jar`.
 
+If your Java setup is complex, you may also override our classpath mechanism
+completely by specifying an environment variable called `ZOOKEEPER_CLASSPATH`.
+If provided, it will be used unmodified as the Java classpath for Zookeeper.
+
+You can specify an optional `ZOOKEEPER_PORT_OFFSET` environment variable to
+influence the ports the cluster is using. By default the offset is 20000 and
+a cluster with three members will use ports 20000, 20010 and 20020.
+
 
 Kazoo Test Harness
 ==================
@@ -26,11 +34,9 @@ Example:
 
 .. code-block:: python
 
-    import unittest
-
     from kazoo.testing import KazooTestHarness
 
-    class MyTest(unittest.TestCase, KazooTestHarness):
+    class MyTest(KazooTestHarness):
         def setUp(self):
             self.setup_zookeeper()
 
@@ -60,3 +66,16 @@ one above:
             self.client.ensure_path('/test/path')
             result = self.client.get('/test/path')
             ...
+
+Zake
+====
+
+For those that do not need (or desire) to setup a Zookeeper cluster to test
+integration with kazoo there is also a library called
+`zake <https://pypi.python.org/pypi/zake/>`_. Contributions to
+`Zake's github repository <https://github.com/yahoo/Zake>`_ are welcome.
+
+Zake can be used to provide a *mock client* to layers of your application that
+interact with kazoo (using the same client interface) during testing to allow
+for introspection of what was stored, which watchers are active (and more)
+after your test of your application code has finished.

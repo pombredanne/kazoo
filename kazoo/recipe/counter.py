@@ -1,4 +1,9 @@
-"""Zookeeper Counter"""
+"""Zookeeper Counter
+
+:Maintainer: None
+:Status: Unknown
+
+"""
 
 from kazoo.exceptions import BadVersionError
 from kazoo.retry import ForceRetryError
@@ -24,6 +29,7 @@ class Counter(object):
     .. code-block:: python
 
         zk = KazooClient()
+        zk.start()
         counter = zk.Counter("/int")
         counter += 2
         counter -= 1

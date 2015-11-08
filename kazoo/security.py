@@ -1,6 +1,4 @@
-"""Kazoo Security
-
-"""
+"""Kazoo Security"""
 from base64 import b64encode
 from collections import namedtuple
 import hashlib
@@ -53,7 +51,7 @@ class Permissions(object):
 
 # Shortcuts for common Ids
 ANYONE_ID_UNSAFE = Id('world', 'anyone')
-AUTH_IDS = Id('world', 'anyone')
+AUTH_IDS = Id('auth', '')
 
 # Shortcuts for common ACLs
 OPEN_ACL_UNSAFE = [ACL(Permissions.ALL, ANYONE_ID_UNSAFE)]
@@ -71,7 +69,7 @@ def make_digest_acl_credential(username, password):
 def make_acl(scheme, credential, read=False, write=False,
              create=False, delete=False, admin=False, all=False):
     """Given a scheme and credential, return an :class:`ACL` object
-    appropriate Kazoo.
+    appropriate for use with Kazoo.
 
     :param scheme: The scheme to use. I.e. `digest`.
     :param credential:
@@ -137,4 +135,4 @@ def make_digest_acl(username, password, read=False, write=False,
     """
     cred = make_digest_acl_credential(username, password)
     return make_acl("digest", cred, read=read, write=write, create=create,
-        delete=delete, admin=admin, all=all)
+                    delete=delete, admin=admin, all=all)

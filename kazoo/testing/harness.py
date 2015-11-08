@@ -1,16 +1,19 @@
 """Kazoo testing harnesses"""
-import atexit
+
 import logging
 import os
 import uuid
-import threading
 import unittest
 
+from kazoo import python2atexit as atexit
+
 from kazoo.client import KazooClient
+from kazoo.exceptions import KazooException, NotEmptyError
 from kazoo.protocol.states import (
     KazooState
 )
 from kazoo.testing.common import ZookeeperCluster
+from kazoo.protocol.connection import _CONNECTION_DROP, _SESSION_EXPIRED
 
 log = logging.getLogger(__name__)
 
@@ -21,16 +24,24 @@ def get_global_cluster():
     global CLUSTER
     if CLUSTER is None:
         ZK_HOME = os.environ.get("ZOOKEEPER_PATH")
-        assert ZK_HOME, (
-            "ZOOKEEPER_PATH environment variable must be defined.\n "
+        ZK_CLASSPATH = os.environ.get("ZOOKEEPER_CLASSPATH")
+        ZK_PORT_OFFSET = int(os.environ.get("ZOOKEEPER_PORT_OFFSET", 20000))
+
+        assert ZK_HOME or ZK_CLASSPATH, (
+            "Either ZOOKEEPER_PATH or ZOOKEEPER_CLASSPATH environment "
+            "variable must be defined.\n"
             "For deb package installations this is /usr/share/java")
 
-        CLUSTER = ZookeeperCluster(ZK_HOME)
+        CLUSTER = ZookeeperCluster(
+            install_path=ZK_HOME,
+            classpath=ZK_CLASSPATH,
+            port_offset=ZK_PORT_OFFSET,
+        )
         atexit.register(lambda cluster: cluster.terminate(), CLUSTER)
     return CLUSTER
 
 
-class KazooTestHarness(object):
+class KazooTestHarness(unittest.TestCase):
     """Harness for testing code that uses Kazoo
 
     This object can be used directly or as a mixin. It supports starting
@@ -39,7 +50,7 @@ class KazooTestHarness(object):
 
     Example::
 
-        class MyTestCase(unittest.TestCase, KazooTestHarness):
+        class MyTestCase(KazooTestHarness):
             def setUp(self):
                 self.setup_zookeeper()
 
@@ -56,8 +67,10 @@ class KazooTestHarness(object):
 
     """
 
-    def __init__(self):
+    def __init__(self, *args, **kw):
+        super(KazooTestHarness, self).__init__(*args, **kw)
         self.client = None
+        self._clients = []
 
     @property
     def cluster(self):
@@ -68,46 +81,22 @@ class KazooTestHarness(object):
         return ",".join([s.address for s in self.cluster])
 
     def _get_nonchroot_client(self):
-        return KazooClient(self.servers)
+        c = KazooClient(self.servers)
+        self._clients.append(c)
+        return c
 
     def _get_client(self, **kwargs):
-        return KazooClient(self.hosts, **kwargs)
+        c = KazooClient(self.hosts, **kwargs)
+        self._clients.append(c)
+        return c
 
-    def expire_session(self, client_id=None):
-        """Force ZK to expire a client session
+    def lose_connection(self, event_factory):
+        """Force client to lose connection with server"""
+        self.__break_connection(_CONNECTION_DROP, KazooState.SUSPENDED, event_factory)
 
-        :param client_id: id of client to expire. If unspecified, the id of
-                          self.client will be used.
-
-        """
-        client_id = client_id or self.client.client_id
-
-        lost = threading.Event()
-        safe = threading.Event()
-
-        def watch_loss(state):
-            if state == KazooState.LOST:
-                lost.set()
-            if lost.is_set() and state == KazooState.CONNECTED:
-                safe.set()
-                return True
-
-        self.client.add_listener(watch_loss)
-
-        # Sometimes we have to do this a few times
-        attempts = 0
-        while attempts < 5 and not lost.is_set():
-            client = KazooClient(self.hosts, client_id=client_id, timeout=0.8)
-            try:
-                client.start()
-                client.stop()
-            except Exception:
-                pass
-            lost.wait(5)
-            attempts += 1
-        # Wait for the reconnect now
-        safe.wait(15)
-        self.client.retry(self.client.get_async, '/')
+    def expire_session(self, event_factory):
+        """Force ZK to expire a client session"""
+        self.__break_connection(_SESSION_EXPIRED, KazooState.LOST, event_factory)
 
     def setup_zookeeper(self, **client_options):
         """Create a ZK cluster and chrooted :class:`KazooClient`
@@ -115,11 +104,14 @@ class KazooTestHarness(object):
         The cluster will only be created on the first invocation and won't be
         fully torn down until exit.
         """
-        if not self.cluster[0].running:
+        do_start = False
+        for s in self.cluster:
+            if not s.running:
+                do_start = True
+        if do_start:
             self.cluster.start()
         namespace = "/kazootests" + uuid.uuid4().hex
         self.hosts = self.servers + namespace
-
         if 'timeout' not in client_options:
             client_options['timeout'] = 0.8
         self.client = self._get_client(**client_options)
@@ -127,24 +119,45 @@ class KazooTestHarness(object):
         self.client.ensure_path("/")
 
     def teardown_zookeeper(self):
-        """Clean up any ZNodes created during the test
-        """
-        if not self.cluster[0].running:
-            self.cluster.start()
+        """Reset and cleanup the zookeeper cluster that was started."""
+        while self._clients:
+            c = self._clients.pop()
+            try:
+                c.stop()
+            except KazooException:
+                log.exception("Failed stopping client %s", c)
+            finally:
+                c.close()
+        self.client = None
 
-        if self.client and self.client.connected:
-            self.client.delete('/', recursive=True)
-            self.client.stop()
-            del self.client
-        else:
-            client = self._get_client()
-            client.start()
-            client.delete('/', recursive=True)
-            client.stop()
-            del client
+    def __break_connection(self, break_event, expected_state, event_factory):
+        """Break ZooKeeper connection using the specified event."""
+
+        lost = event_factory()
+        safe = event_factory()
+
+        def watch_loss(state):
+            if state == expected_state:
+                lost.set()
+            elif lost.is_set() and state == KazooState.CONNECTED:
+                safe.set()
+                return True
+
+        self.client.add_listener(watch_loss)
+        self.client._call(break_event, None)
+
+        lost.wait(5)
+        if not lost.isSet():
+            raise Exception("Failed to get notified of broken connection.")
+
+        safe.wait(15)
+        if not safe.isSet():
+            raise Exception("Failed to see client reconnect.")
+
+        self.client.retry(self.client.get_async, '/')
 
 
-class KazooTestCase(unittest.TestCase, KazooTestHarness):
+class KazooTestCase(KazooTestHarness):
     def setUp(self):
         self.setup_zookeeper()
 

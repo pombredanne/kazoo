@@ -1,4 +1,9 @@
-"""ZooKeeper Leader Elections"""
+"""ZooKeeper Leader Elections
+
+:Maintainer: None
+:Status: Unknown
+
+"""
 from kazoo.exceptions import CancelledError
 
 
@@ -8,6 +13,7 @@ class Election(object):
     Example usage with a :class:`~kazoo.client.KazooClient` instance::
 
         zk = KazooClient()
+        zk.start()
         election = zk.Election("/electionpath", "my-identifier")
 
         # blocks until the election is won, then calls

@@ -13,7 +13,7 @@ class ZookeeperError(KazooException):
 
 
 class CancelledError(KazooException):
-    """Raised when a process is canceled by another thread"""
+    """Raised when a process is cancelled by another thread"""
 
 
 class ConfigurationError(KazooException):
@@ -26,7 +26,21 @@ class ZookeeperStoppedError(KazooException):
 
 
 class ConnectionDropped(KazooException):
-    """ Internal error for jumping out of loops """
+    """Internal error for jumping out of loops"""
+
+
+class LockTimeout(KazooException):
+    """Raised if failed to acquire a lock.
+
+    .. versionadded:: 1.1
+    """
+
+
+class WriterNotClosedException(KazooException):
+    """Raised if the writer is unable to stop closing when requested.
+
+    .. versionadded:: 1.2
+    """
 
 
 def _invalid_error_code():
@@ -90,6 +104,16 @@ class OperationTimeoutError(ZookeeperError):
 
 @_zookeeper_exception(-8)
 class BadArgumentsError(ZookeeperError):
+    pass
+
+
+@_zookeeper_exception(-13)
+class NewConfigNoQuorumError(ZookeeperError):
+    pass
+
+
+@_zookeeper_exception(-14)
+class ReconfigInProcessError(ZookeeperError):
     pass
 
 

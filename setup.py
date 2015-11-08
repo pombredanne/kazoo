@@ -1,7 +1,7 @@
-__version__ = '1.0'
 
 import os
 import sys
+import re
 
 from setuptools import setup, find_packages
 
@@ -10,35 +10,39 @@ with open(os.path.join(here, 'README.rst')) as f:
     README = f.read()
 with open(os.path.join(here, 'CHANGES.rst')) as f:
     CHANGES = f.read()
+version = ''
+with open(os.path.join(here, 'kazoo', 'version.py')) as f:
+    version = re.search(r'^__version__\s*=\s*[\'"]([^\'"]*)[\'"]',
+                        f.read(), re.MULTILINE).group(1)
 
 PYTHON3 = sys.version_info > (3, )
 PYPY = getattr(sys, 'pypy_version_info', False) and True or False
 
-install_requires = [
-    'zope.interface >= 3.8.0',  # has zope.interface.registry
-]
+install_requires = ['six']
 
 tests_require = install_requires + [
     'coverage',
     'mock',
     'nose',
+    'flake8',
 ]
 
 if not (PYTHON3 or PYPY):
     tests_require += [
         'gevent',
+        'eventlet',
     ]
 
 on_rtd = os.environ.get('READTHEDOCS', None) == 'True'
 if on_rtd:
     install_requires.extend([
         'gevent',
-        'repoze.sphinx.autointerface',
+        'eventlet',
     ])
 
 setup(
     name='kazoo',
-    version=__version__,
+    version=version,
     description='Higher Level Zookeeper Client',
     long_description=README + '\n\n' + CHANGES,
     classifiers=[
@@ -51,8 +55,8 @@ setup(
         "Programming Language :: Python :: 2.6",
         "Programming Language :: Python :: 2.7",
         "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.2",
         "Programming Language :: Python :: 3.3",
+        "Programming Language :: Python :: 3.4",
         "Programming Language :: Python :: Implementation :: CPython",
         "Programming Language :: Python :: Implementation :: PyPy",
         "Topic :: Communications",
@@ -61,7 +65,7 @@ setup(
     ],
     keywords='zookeeper lock leader configuration',
     author="Kazoo team",
-    author_email="user@zookeeper.apache.org",
+    author_email="python-zk@googlegroups.com",
     url="https://kazoo.readthedocs.org",
     license="Apache 2.0",
     packages=find_packages(),

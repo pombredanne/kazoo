@@ -1,9 +1,392 @@
 Changelog
 =========
 
-1.0 (unreleased)
+2.2.1 (2015-06-17)
+------------------
+
+Features
+********
+
+Bug Handling
+************
+- handle NameError with basestring on py3k.
+
+Documentation
+*************
+
+2.2 (2015-06-15)
 ----------------
 
+Documentation
+*************
+
+Features
+********
+
+-  Issue #234: Add support for reconfig cluster membership operation
+
+Bug Handling
+************
+
+- #315: multiple acquires of a kazoo lock using the lock recipe would
+  block when using `acquire` even when non-blocking is specified (only
+  when the lock was/has been already acquired).
+- #318: At exit register takes ``*args`` and ``**kwargs`` not args and kargs
+
+Documentation
+*************
+
+2.1 (2015-05-11)
+----------------
+
+Features
+********
+
+- Start running tests against Zookeeper 3.5.0 alpha and explicitly configure
+  the `admin.serverPort` in tests to avoid port conflicts. The Zookeeper
+  alpha version is not yet officially supported.
+- Integrate eventlet *handler* support into kazoo so that along with [gevent,
+  threading] handlers there can now be a dedicated eventlet handler for
+  projects that need to (or want to) use eventlet (such as those working
+  in the openstack community). The ``requirements_eventlet.txt`` file lists
+  the optional eventlet requirement(s) that needs to be satisfied when this
+  new handler is used.
+- Use ``six`` to nicely handle the cross compatibility of kazoo with
+  python 2.x and 3.x (reducing/removing the need to have custom compatibility
+  code that replicates what six already provides).
+- Add ``state_change_event`` to ``kazoo.recipe.partitioner.SetPartitioner``
+  which is set on every state change.
+- Add a NonBlockingLease recipe.  The recipe allows e.g. cron jobs scheduled
+  on multiple machines to ensure that at most N instances will run a particular
+  job, with lease timeout for graceful handover in case of node failures.
+
+
+Bug Handling
+************
+
+- #291: Kazoo lock recipe was only partially re-entrant in that multiple
+  calls to `acquire` would obtain the the lock but the first call to `release`
+  would remove the underlying lock. This would leave the X - 1 other `acquire`
+  statements unprotected (and no longer holding there expected lock). To fix
+  this the comment about that lock recipe being re-entrant has been removed
+  and multiple acquires will now block when attempted.
+
+- #78: Kazoo now uses socketpairs instead of pipes making it compatible with
+  Windows.
+
+- #144, #221: Let `client.command` work with IPv6 addresses.
+
+- #216: Fixed timeout for ConnectionHandler._invoke.
+
+- #261: Creating a sequential znode under / doesn't work.
+
+- #274: Add server_version() retries (by default 4 attempts will be made) to
+  better handle flakey responses.
+
+- #271: Fixed handling of KazooState.SUSPENDED in SetPartitioner.
+
+- #283: Fixed a race condition in SetPartitioner when party changes during
+  handling of lock acquisition.
+
+- #303: don't crash on random input as the hosts string.
+
+Documentation
+*************
+
+- #222: Document that committed on the transaction is used to ensure only one
+  commit and is not an indicator of whether operations in the transaction
+  returned desired results.
+
+2.0 (2014-06-19)
+----------------
+
+Documentation
+*************
+
+- Extend support to Python 3.4, deprecating Python 3.2.
+- Issue #198: Mention Zake as a sophisticated kazoo mock testing library.
+- Issue #181: Add documentation on basic logging setup.
+
+
+2.0b1 (2014-04-24)
+------------------
+
+API Changes
+***********
+
+- Null or None data is no longer treated as "". Pull req #165, patch by
+  Raul Gutierrez S. This will affect how you should treat null data in a
+  znode vs. an empty string.
+- Passing acl=[] to create() now works properly instead of an InvalidACLError
+  as it returned before. Patch by Raul Gutierrez S in PR #164.
+- Removed the dependency on zope.interface. The classes in the interfaces
+  module are left for documentation purposes only (issue #131).
+
+Features
+********
+
+- Logging levels have been reduced.
+
+  - Logging previously at the ``logging.DEBUG`` level is now logged at
+    the ``kazoo.loggingsupport.BLATHER`` level (5).
+
+  - Some low-level logging previously at the ``logging.INFO`` level is
+    now logged at the ``logging.DEBUG`` level.
+
+- Issue #133: Introduce a new environment variable `ZOOKEEPER_PORT_OFFSET`
+  for the testing support, to run the testing cluster on a different range.
+
+Bug Handling
+************
+
+- When authenticating via add_auth() the auth data will be saved to ensure that
+  the authentication happens on reconnect (as is the case when feeding auth
+  data via KazooClient's constructor). PR #172, patch by Raul Gutierrez S.
+- Change gevent import to remove deprecation warning when newer gevent is
+  used. PR #191, patch by Hiroaki Kawai.
+- Lock recipe was failing to use the client's sleep_func causing issues with
+  gevent. Issue #150.
+- Calling a DataWatch or ChildrenWatch instance twice (decorator) now throws
+  an exception as only a single function can be associated with a single
+  watcher. Issue #154.
+- Another fix for atexit handling so that when disposing of connections the
+  atexit handler is removed. PR #190, patch by Devaev Maxim.
+- Fix atexit handling for kazoo threading handler, PR #183. Patch by
+  Brian Wickman.
+- Partitioner should handle a suspended connection properly and restore
+  an allocated state if it was allocated previously. Patch by Manish Tomar.
+- Issue #167: Closing a client that was never started throws a type error.
+  Patch by Joshua Harlow.
+- Passing dictionaries to KazooClient.__init__() wasn't actually working
+  properly. Patch by Ryan Uber.
+- Issue #119: Handler timeout takes the max of the random interval or
+  the read timeout to ensure a negative number isn't used for the read
+  timeout.
+- Fix ordering of exception catches in lock.acquire as it was capturing a
+  parent exception before the child. Patch by ReneSac.
+- Fix issue with client.stop() not always setting the client state to
+  KeeperState.CLOSED. Patch by Jyrki Pulliainen in PR #174.
+- Issue #169: Fixed pipes leaking into child processes.
+
+Documentation
+*************
+
+- Add section on contributing recipes, add maintainer/status information for
+  existing recipes.
+- Add note about alternate use of DataWatch.
+
+1.3.1 (2013-09-25)
+------------------
+
+Bug Handling
+************
+
+- #118, #125, #128: Fix unknown variable in KazooClient `command_retry`
+  argument handling.
+
+- #126: Fix `KazooRetry.copy` to correctly copy sleep function.
+
+- #118: Correct session/socket timeout conversion (int vs. float).
+
+Documentation
+*************
+
+- #121: Add a note about `kazoo.recipe.queue.LockingQueue` requiring a
+  Zookeeper 3.4+ server.
+
+
+1.3 (2013-09-05)
+----------------
+
+Features
+********
+
+- #115: Limit the backends we use for SLF4J during tests.
+
+- #112: Add IPv6 support. Patch by Dan Kruchinin.
+
+1.2.1 (2013-08-01)
+------------------
+
+Bug Handling
+************
+
+- Issue #108: Circular import fail when importing kazoo.recipe.watchers
+  directly has now been resolved. Watchers and partitioner properly import
+  the KazooState from kazoo.protocol.states rather than kazoo.client.
+- Issue #109: Partials not usable properly as a datawatch call can now be
+  used. All funcs will be called with 3 args and fall back to 2 args if
+  there's an argument error.
+- Issue #106, #107: `client.create_async` didn't strip change root from the
+  returned path.
+
+1.2 (2013-07-24)
+----------------
+
+Features
+********
+
+- KazooClient can now be stopped more reliably even if its in the middle
+  of a long retry sleep. This utilizes the new interrupt feature of
+  KazooRetry which lets the sleep be broken down into chunks and an
+  interrupt function called to determine if the retry should fail early.
+
+- Issue #62, #92, #89, #101, #102: Allow KazooRetry to have a
+  max deadline, transition properly when connection fails to LOST, and
+  setup separate connection retry behavior from client command retry
+  behavior. Patches by Mike Lundy.
+
+- Issue #100: Make it easier to see exception context in threading and
+  connection modules.
+
+- Issue #85: Increase information density of logs and don't prevent
+  dynamic reconfiguration of log levels at runtime.
+
+- Data-watchers for the same node are no longer 'stacked'. That is, if
+  a get and an exists call occur for the same node with the same watch
+  function, then it will be registered only once. This change results in
+  Kazoo behaving per Zookeeper client spec regarding repeat watch use.
+
+Bug Handling
+************
+
+- Issue #53: Throw a warning upon starting if the chroot path doesn't exist
+  so that it's more obvious when the chroot should be created before
+  performing more operations.
+
+- Kazoo previously would let the same function be registered as a data-watch
+  or child-watch multiple times, and then call it multiple times upon being
+  triggered. This was non-compliant Zookeeper client behavior, the same
+  watch can now only be registered once for the same znode path per Zookeeper
+  client documentation.
+
+- Issue #105: Avoid rare import lock problems by moving module imports in
+  client.py to the module scope.
+
+- Issue #103: Allow prefix-less sequential znodes.
+
+- Issue #98: Extend testing ZK harness to work with different file locations
+  on some versions of Debian/Ubuntu.
+
+- Issue #97: Update some docstrings to reflect current state of handlers.
+
+- Issue #62, #92, #89, #101, #102: Allow KazooRetry to have a
+  max deadline, transition properly when connection fails to LOST, and
+  setup separate connection retry behavior from client command retry
+  behavior. Patches by Mike Lundy.
+
+API Changes
+***********
+
+- The `kazoo.testing.harness.KazooTestHarness` class directly inherits from
+  `unittest.TestCase` and you need to ensure to call its `__init__` method.
+
+- DataWatch no longer takes any parameters besides for the optional function
+  during instantiation. The additional options are now implicitly True, with
+  the user being left to ignore events as they choose. See the DataWatch
+  API docs for more information.
+
+- Issue #99: Better exception raised when the writer fails to close. A
+  WriterNotClosedException that inherits from KazooException is now raised
+  when the writer fails to close in time.
+
+1.1 (2013-06-08)
+----------------
+
+Features
+********
+
+- Issue #93: Add timeout option to lock/semaphore acquire methods.
+
+- Issue #79 / #90: Add ability to pass the WatchedEvent to DataWatch and
+  ChildWatch functions.
+
+- Respect large client timeout values when closing the connection.
+
+- Add a `max_leases` consistency check to the semaphore recipe.
+
+- Issue #76: Extend testing helpers to allow customization of the Java
+  classpath by specifying the new `ZOOKEEPER_CLASSPATH` environment variable.
+
+- Issue #65: Allow non-blocking semaphore acquisition.
+
+Bug Handling
+************
+
+- Issue #96: Provide Windows compatibility in testing harness.
+
+- Issue #95: Handle errors deserializing connection response.
+
+- Issue #94: Clean up stray bytes in connection pipe.
+
+- Issue #87 / #88: Allow re-acquiring lock after cancel.
+
+- Issue #77: Use timeout in initial socket connection.
+
+- Issue #69: Only ensure path once in lock and semaphore recipes.
+
+- Issue #68: Closing the connection causes exceptions to be raised by watchers
+  which assume the connection won't be closed when running commands.
+
+- Issue #66: Require ping reply before sending another ping, otherwise the
+  connection will be considered dead and a ConnectionDropped will be raised
+  to trigger a reconnect.
+
+- Issue #63: Watchers weren't reset on lost connection.
+
+- Issue #58: DataWatcher failed to re-register for changes after non-existent
+  node was created then deleted.
+
+API Changes
+***********
+
+- KazooClient.create_async now supports the makepath argument.
+
+- KazooClient.ensure_path now has an async version, ensure_path_async.
+
+1.0 (2013-03-26)
+----------------
+
+Features
+********
+
+- Added a LockingQueue recipe. The queue first locks an item and removes it
+  from the queue only after the consume() method is called. This enables other
+  nodes to retake the item if an error occurs on the first node.
+
+Bug Handling
+************
+
+- Issue #50: Avoid problems with sleep function in mixed gevent/threading
+  setup.
+
+- Issue #56: Avoid issues with watch callbacks evaluating to false.
+
+1.0b1 (2013-02-24)
+------------------
+
+Features
+********
+
+- Refactored the internal connection handler to use a single thread. It now
+  uses a deque and pipe to signal the ZK thread that there's a new command to
+  send, so that the ZK thread can send it, or retrieve a response.
+  Processing ZK requests and responses serially in a single thread eliminates
+  the need for a bunch of the locking, the peekable queue and two threads
+  working on the same underlying socket.
+
+- Issue #48: Added documentation for the `retry` helper module.
+
+- Issue #55: Fix `os.pipe` file descriptor leak and introduce a
+  `KazooClient.close` method. The method is particular useful in tests, where
+  multiple KazooClients are created and closed in the same process.
+
+Bug Handling
+************
+
+- Issue #46: Avoid TypeError in GeneratorContextManager on process shutdown.
+
+- Issue #43: Let DataWatch return node data if allow_missing_node is used.
 
 0.9 (2013-01-07)
 ----------------

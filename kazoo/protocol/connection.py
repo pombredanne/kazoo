@@ -1,9 +1,9 @@
 """Zookeeper Protocol Connection Handler"""
 import logging
-import os
 import random
 import select
 import socket
+
 import sys
 import time
 from binascii import hexlify
@@ -16,6 +16,7 @@ from kazoo.exceptions import (
     SessionExpiredError,
     NoNodeError
 )
+from kazoo.loggingsupport import BLATHER
 from kazoo.protocol.serialization import (
     Auth,
     Close,
@@ -23,6 +24,7 @@ from kazoo.protocol.serialization import (
     Exists,
     GetChildren,
     Ping,
+    PingInstance,
     ReplyHeader,
     Transaction,
     Watch,
@@ -34,10 +36,20 @@ from kazoo.protocol.states import (
     WatchedEvent,
     EVENT_TYPE_MAP,
 )
-from kazoo.handlers.utils import create_pipe
+from kazoo.retry import (
+    ForceRetryError,
+    RetryFailedError
+)
 
 log = logging.getLogger(__name__)
 
+
+# Special testing hook objects used to force a session expired error as
+# if it came from the server
+_SESSION_EXPIRED = object()
+_CONNECTION_DROP = object()
+
+STOP_CONNECTING = object()
 
 CREATED_EVENT = 1
 DELETED_EVENT = 2
@@ -73,9 +85,9 @@ class RWPinger(object):
     the iterator will yield False if called too soon.
 
     """
-    def __init__(self, hosts, socket_func, socket_handling):
+    def __init__(self, hosts, connection_func, socket_handling):
         self.hosts = hosts
-        self.socket = socket_func
+        self.connection = connection_func
         self.last_attempt = None
         self.socket_handling = socket_handling
 
@@ -84,31 +96,33 @@ class RWPinger(object):
             self.last_attempt = time.time()
         delay = 0.5
         while True:
-            jitter = random.randint(0, 100) / 100.0
-            while time.time() < self.last_attempt + delay + jitter:
-                # Skip rw ping checks if its too soon
-                yield False
-            for host, port in self.hosts:
-                sock = self.socket()
-                log.debug("Pinging server for r/w: %s:%s", host, port)
-                self.last_attempt = time.time()
-                try:
-                    with self.socket_handling():
-                        sock.connect((host, port))
-                        sock.sendall(b"isro")
-                        result = sock.recv(8192)
-                        sock.close()
-                        if result == b'rw':
-                            yield (host, port)
-                        else:
-                            yield False
-                except ConnectionDropped:
-                    yield False
+            yield self._next_server(delay)
 
-                # Add some jitter between host pings
-                while time.time() < self.last_attempt + jitter:
-                    yield False
-            delay *= 2
+    def _next_server(self, delay):
+        jitter = random.randint(0, 100) / 100.0
+        while time.time() < self.last_attempt + delay + jitter:
+            # Skip rw ping checks if its too soon
+            return False
+        for host, port in self.hosts:
+            log.debug("Pinging server for r/w: %s:%s", host, port)
+            self.last_attempt = time.time()
+            try:
+                with self.socket_handling():
+                    sock = self.connection((host, port))
+                    sock.sendall(b"isro")
+                    result = sock.recv(8192)
+                    sock.close()
+                    if result == b'rw':
+                        return (host, port)
+                    else:
+                        return False
+            except ConnectionDropped:
+                return False
+
+            # Add some jitter between host pings
+            while time.time() < self.last_attempt + jitter:
+                return False
+        delay *= 2
 
 
 class RWServerAvailable(Exception):
@@ -117,22 +131,28 @@ class RWServerAvailable(Exception):
 
 class ConnectionHandler(object):
     """Zookeeper connection handler"""
-    def __init__(self, client, retry_sleeper, log_debug=False):
+    def __init__(self, client, retry_sleeper, logger=None):
         self.client = client
         self.handler = client.handler
         self.retry_sleeper = retry_sleeper
+        self.logger = logger or log
 
         # Our event objects
+        self.connection_closed = client.handler.event_object()
+        self.connection_closed.set()
         self.connection_stopped = client.handler.event_object()
         self.connection_stopped.set()
+        self.ping_outstanding = client.handler.event_object()
 
-        self._read_pipe, self._write_pipe = create_pipe()
+        self._read_sock = None
+        self._write_sock = None
 
-        self.log_debug = log_debug
         self._socket = None
         self._xid = None
         self._rw_server = None
         self._ro_mode = False
+
+        self._connection_routine = None
 
     # This is instance specific to avoid odd thread bug issues in Python
     # during shutdown global cleanup
@@ -142,21 +162,46 @@ class ConnectionHandler(object):
             yield
         except (socket.error, select.error) as e:
             err = getattr(e, 'strerror', e)
-            raise ConnectionDropped("socket connection error: %s", err)
+            raise ConnectionDropped("socket connection error: %s" % (err,))
 
     def start(self):
         """Start the connection up"""
-        self.handler.spawn(self.zk_loop)
+        if self.connection_closed.is_set():
+            rw_sockets = self.handler.create_socket_pair()
+            self._read_sock, self._write_sock = rw_sockets
+            self.connection_closed.clear()
+        if self._connection_routine:
+            raise Exception("Unable to start, connection routine already "
+                            "active.")
+        self._connection_routine = self.handler.spawn(self.zk_loop)
 
     def stop(self, timeout=None):
         """Ensure the writer has stopped, wait to see if it does."""
         self.connection_stopped.wait(timeout)
+        if self._connection_routine:
+            self._connection_routine.join()
+            self._connection_routine = None
         return self.connection_stopped.is_set()
+
+    def close(self):
+        """Release resources held by the connection
+
+        The connection can be restarted afterwards.
+        """
+        if not self.connection_stopped.is_set():
+            raise Exception("Cannot close connection until it is stopped")
+        self.connection_closed.set()
+        ws, rs = self._write_sock, self._read_sock
+        self._write_sock = self._read_sock = None
+        if ws is not None:
+            ws.close()
+        if rs is not None:
+            rs.close()
 
     def _server_pinger(self):
         """Returns a server pinger iterable, that will ping the next
         server in the list, and apply a back-off between attempts."""
-        return RWPinger(self.client.hosts, self.handler.socket,
+        return RWPinger(self.client.hosts, self.handler.create_connection,
                         self._socket_error_handling)
 
     def _read_header(self, timeout):
@@ -175,7 +220,8 @@ class ConnectionHandler(object):
                 if not s:  # pragma: nocover
                     # If the read list is empty, we got a timeout. We don't
                     # have to check wlist and xlist as we don't set any
-                    raise self.handler.timeout_exception("socket time-out")
+                    raise self.handler.timeout_exception("socket time-out"
+                                                         " during read")
 
                 chunk = self._socket.recv(remaining)
                 if chunk == b'':
@@ -192,14 +238,14 @@ class ConnectionHandler(object):
         if xid:
             header, buffer, offset = self._read_header(timeout)
             if header.xid != xid:
-                raise RuntimeError('xids do not match, expected %r received %r',
-                                   xid, header.xid)
+                raise RuntimeError('xids do not match, expected %r '
+                                   'received %r', xid, header.xid)
             if header.zxid > 0:
                 zxid = header.zxid
             if header.err:
                 callback_exception = EXCEPTIONS[header.err]()
-                if self.log_debug:
-                    log.debug('Received error %r', callback_exception)
+                self.logger.debug(
+                    'Received error(xid=%s) %r', xid, callback_exception)
                 raise callback_exception
             return zxid
 
@@ -208,8 +254,16 @@ class ConnectionHandler(object):
         msg = self._read(length, timeout)
 
         if hasattr(request, 'deserialize'):
-            obj, _ = request.deserialize(msg, 0)
-            log.debug('Read response %s', obj)
+            try:
+                obj, _ = request.deserialize(msg, 0)
+            except Exception:
+                self.logger.exception(
+                    "Exception raised during deserialization "
+                    "of request: %s", request)
+
+                # raise ConnectionDropped so connect loop will retry
+                raise ConnectionDropped('invalid server response')
+            self.logger.log(BLATHER, 'Read response %s', obj)
             return obj, zxid
 
         return zxid
@@ -223,8 +277,9 @@ class ConnectionHandler(object):
         if request.type:
             b.extend(int_struct.pack(request.type))
         b += request.serialize()
-        if self.log_debug:
-            log.debug("Sending request: %s", request)
+        self.logger.log(
+            (BLATHER if isinstance(request, Ping) else logging.DEBUG),
+            "Sending request(xid=%s): %s", xid, request)
         self._write(int_struct.pack(len(b)) + b, timeout)
 
     def _write(self, msg, timeout):
@@ -237,7 +292,8 @@ class ConnectionHandler(object):
                 if not s:  # pragma: nocover
                     # If the write list is empty, we got a timeout. We don't
                     # have to check rlist and xlist as we don't set any
-                    raise self.handler.timeout_exception("socket time-out")
+                    raise self.handler.timeout_exception("socket time-out"
+                                                         " during write")
                 msg_slice = buffer(msg, sent)
                 bytes_sent = self._socket.send(msg_slice)
                 if not bytes_sent:
@@ -249,8 +305,7 @@ class ConnectionHandler(object):
         watch, offset = Watch.deserialize(buffer, offset)
         path = watch.path
 
-        if self.log_debug:
-            log.debug('Received EVENT: %s', watch)
+        self.logger.debug('Received EVENT: %s', watch)
 
         watchers = []
 
@@ -262,7 +317,7 @@ class ConnectionHandler(object):
         elif watch.type == CHILD_EVENT:
             watchers.extend(client._child_watchers.pop(path, []))
         else:
-            log.warn('Received unknown event %r', watch.type)
+            self.logger.warn('Received unknown event %r', watch.type)
             return
 
         # Strip the chroot if needed
@@ -287,14 +342,14 @@ class ConnectionHandler(object):
                                'received %r', xid, header.xid)
 
         # Determine if its an exists request and a no node error
-        exists_error = header.err == NoNodeError.code and \
-                       request.type == Exists.type
+        exists_error = (header.err == NoNodeError.code and
+                        request.type == Exists.type)
 
         # Set the exception if its not an exists error
         if header.err and not exists_error:
             callback_exception = EXCEPTIONS[header.err]()
-            if self.log_debug:
-                log.debug('Received error %r', callback_exception)
+            self.logger.debug(
+                'Received error(xid=%s) %r', xid, callback_exception)
             if async_object:
                 async_object.set_exception(callback_exception)
         elif request and async_object:
@@ -306,13 +361,13 @@ class ConnectionHandler(object):
                 try:
                     response = request.deserialize(buffer, offset)
                 except Exception as exc:
-                    if self.log_debug:
-                        log.debug("Exception raised during deserialization"
-                                  " of request: %s", request)
-                    log.exception(exc)
+                    self.logger.exception(
+                        "Exception raised during deserialization "
+                        "of request: %s", request)
                     async_object.set_exception(exc)
                     return
-                log.debug('Received response: %r', response)
+                self.logger.debug(
+                    'Received response(xid=%s): %r', xid, response)
 
                 # We special case a Transaction as we have to unchroot things
                 if request.type == Transaction.type:
@@ -324,13 +379,12 @@ class ConnectionHandler(object):
             watcher = getattr(request, 'watcher', None)
             if not client._stopped.is_set() and watcher:
                 if isinstance(request, GetChildren):
-                    client._child_watchers[request.path].append(watcher)
+                    client._child_watchers[request.path].add(watcher)
                 else:
-                    client._data_watchers[request.path].append(watcher)
+                    client._data_watchers[request.path].add(watcher)
 
         if isinstance(request, Close):
-            if self.log_debug:
-                log.debug('Read close response')
+            self.logger.log(BLATHER, 'Read close response')
             return CLOSE_RESPONSE
 
     def _read_socket(self, read_timeout):
@@ -339,24 +393,21 @@ class ConnectionHandler(object):
 
         header, buffer, offset = self._read_header(read_timeout)
         if header.xid == PING_XID:
-            if self.log_debug:
-                log.debug('Received PING')
+            self.logger.log(BLATHER, 'Received Ping')
+            self.ping_outstanding.clear()
         elif header.xid == AUTH_XID:
-            if self.log_debug:
-                log.debug('Received AUTH')
+            self.logger.log(BLATHER, 'Received AUTH')
 
+            request, async_object, xid = client._pending.popleft()
             if header.err:
-                # We go ahead and fail out the connection, mainly because
-                # thats what Zookeeper client docs think is appropriate
-
-                # XXX TODO: Should we fail out? Or handle auth failure
-                # differently here since the session id is actually valid!
+                async_object.set_exception(AuthFailedError())
                 client._session_callback(KeeperState.AUTH_FAILED)
+            else:
+                async_object.set(True)
         elif header.xid == WATCH_XID:
             self._read_watch_event(buffer, offset)
         else:
-            if self.log_debug:
-                log.debug('Reading for header %r', header)
+            self.logger.log(BLATHER, 'Reading for header %r', header)
 
             return self._read_response(header, buffer, offset)
 
@@ -368,29 +419,37 @@ class ConnectionHandler(object):
         except IndexError:
             # Not actually something on the queue, this can occur if
             # something happens to cancel the request such that we
-            # don't clear the pipe below after sending
+            # don't clear the socket below after sending
+            try:
+                # Clear possible inconsistence (no request in the queue
+                # but have data in the read socket), which causes cpu to spin.
+                self._read_sock.recv(1)
+            except OSError:
+                pass
             return
+
+        # Special case for testing, if this is a _SessionExpire object
+        # then throw a SessionExpiration error as if we were dropped
+        if request is _SESSION_EXPIRED:
+            raise SessionExpiredError("Session expired: Testing")
+        if request is _CONNECTION_DROP:
+            raise ConnectionDropped("Connection dropped: Testing")
 
         # Special case for auth packets
         if request.type == Auth.type:
-            self._submit(request, connect_timeout, AUTH_XID)
-            client._queue.popleft()
-            os.read(self._read_pipe, 1)
-            return
+            xid = AUTH_XID
+        else:
+            self._xid += 1
+            xid = self._xid
 
-        self._xid += 1
-        if self.log_debug:
-            log.debug('xid: %r', self._xid)
-
-        self._submit(request, connect_timeout, self._xid)
+        self._submit(request, connect_timeout, xid)
         client._queue.popleft()
-        os.read(self._read_pipe, 1)
-        client._pending.append((request, async_object, self._xid))
+        self._read_sock.recv(1)
+        client._pending.append((request, async_object, xid))
 
     def _send_ping(self, connect_timeout):
-        if self.log_debug:
-            log.debug('Queue timeout.  Sending PING')
-        self._submit(Ping, connect_timeout, PING_XID)
+        self.ping_outstanding.set()
+        self._submit(PingInstance, connect_timeout, PING_XID)
 
         # Determine if we need to check for a r/w server
         if self._ro_mode:
@@ -401,104 +460,128 @@ class ConnectionHandler(object):
 
     def zk_loop(self):
         """Main Zookeeper handling loop"""
-        if self.log_debug:
-            log.debug('ZK loop started')
+        self.logger.log(BLATHER, 'ZK loop started')
 
         self.connection_stopped.clear()
 
         retry = self.retry_sleeper.copy()
         try:
             while not self.client._stopped.is_set():
-                # If the connect_loop returns False, stop retrying
-                if self._connect_loop(retry) is False:
+                # If the connect_loop returns STOP_CONNECTING, stop retrying
+                if retry(self._connect_loop, retry) is STOP_CONNECTING:
                     break
-
-                # Still going, increment our retry then go through the
-                # list of hosts again
-                if not self.client._stopped.is_set():
-                    retry.increment()
+        except RetryFailedError:
+            self.logger.warning("Failed connecting to Zookeeper "
+                                "within the connection retry policy.")
         finally:
             self.connection_stopped.set()
-            if self.log_debug:
-                log.debug('Connection stopped')
+            self.client._session_callback(KeeperState.CLOSED)
+            self.logger.log(BLATHER, 'Connection stopped')
 
     def _connect_loop(self, retry):
+        # Iterate through the hosts a full cycle before starting over
+        status = None
+        for host, port in self.client.hosts:
+            if self.client._stopped.is_set():
+                status = STOP_CONNECTING
+                break
+            status = self._connect_attempt(host, port, retry)
+            if status is STOP_CONNECTING:
+                break
+
+        if status is STOP_CONNECTING:
+            return STOP_CONNECTING
+        else:
+            raise ForceRetryError('Reconnecting')
+
+    def _connect_attempt(self, host, port, retry):
         client = self.client
-        TimeoutError = self.handler.timeout_exception
+        KazooTimeoutError = self.handler.timeout_exception
         close_connection = False
-        for host, port in client.hosts:
-            self._socket = self.handler.socket()
 
-            # Were we given a r/w server? If so, use that instead
-            if self._rw_server:
-                if self.log_debug:
-                    log.debug("Found r/w server to use, %s:%s", host, port)
-                host, port = self._rw_server
-                self._rw_server = None
+        self._socket = None
 
-            if client._state != KeeperState.CONNECTING:
-                client._session_callback(KeeperState.CONNECTING)
+        # Were we given a r/w server? If so, use that instead
+        if self._rw_server:
+            self.logger.log(BLATHER,
+                            "Found r/w server to use, %s:%s", host, port)
+            host, port = self._rw_server
+            self._rw_server = None
 
-            try:
-                read_timeout, connect_timeout = self._connect(host, port)
-                read_timeout = read_timeout / 1000.0
-                connect_timeout = connect_timeout / 1000.0
-                retry.reset()
-                self._xid = 0
+        if client._state != KeeperState.CONNECTING:
+            client._session_callback(KeeperState.CONNECTING)
 
+        try:
+            read_timeout, connect_timeout = self._connect(host, port)
+            read_timeout = read_timeout / 1000.0
+            connect_timeout = connect_timeout / 1000.0
+            retry.reset()
+            self._xid = 0
+            self.ping_outstanding.clear()
+            with self._socket_error_handling():
                 while not close_connection:
                     # Watch for something to read or send
-                    timeout = read_timeout / 2.0 - random.randint(0, 40) / 100.0
-                    s = self.handler.select([self._socket, self._read_pipe],
-                            [], [], timeout)[0]
+                    jitter_time = random.randint(0, 40) / 100.0
+                    # Ensure our timeout is positive
+                    timeout = max([read_timeout / 2.0 - jitter_time,
+                                   jitter_time])
+                    s = self.handler.select([self._socket, self._read_sock],
+                                            [], [], timeout)[0]
 
                     if not s:
+                        if self.ping_outstanding.is_set():
+                            self.ping_outstanding.clear()
+                            raise ConnectionDropped(
+                                "outstanding heartbeat ping not received")
                         self._send_ping(connect_timeout)
                     elif s[0] == self._socket:
                         response = self._read_socket(read_timeout)
                         close_connection = response == CLOSE_RESPONSE
                     else:
                         self._send_request(read_timeout, connect_timeout)
-
-                if self.log_debug:
-                    log.info('Closing connection to %s:%s', host, port)
-                client._session_callback(KeeperState.CLOSED)
-                return False
-            except (ConnectionDropped, TimeoutError) as e:
-                if isinstance(e, ConnectionDropped):
-                    log.warning('Connection dropped: %s', e)
-                else:
-                    log.warning('Connection time-out')
-                if client._state != KeeperState.CONNECTING:
-                    log.warning("Transition to CONNECTING")
-                    client._session_callback(KeeperState.CONNECTING)
-            except AuthFailedError:
-                log.warning('AUTH_FAILED closing')
-                client._session_callback(KeeperState.AUTH_FAILED)
-                return False
-            except SessionExpiredError:
-                log.warning('Session has expired')
-                client._session_callback(KeeperState.EXPIRED_SESSION)
-            except RWServerAvailable:
-                log.warning('Found a RW server, dropping connection')
+            self.logger.info('Closing connection to %s:%s', host, port)
+            client._session_callback(KeeperState.CLOSED)
+            return STOP_CONNECTING
+        except (ConnectionDropped, KazooTimeoutError) as e:
+            if isinstance(e, ConnectionDropped):
+                self.logger.warning('Connection dropped: %s', e)
+            else:
+                self.logger.warning('Connection time-out: %s', e)
+            if client._state != KeeperState.CONNECTING:
+                self.logger.warning("Transition to CONNECTING")
                 client._session_callback(KeeperState.CONNECTING)
-            except Exception as e:
-                log.exception(e)
-                raise
-            finally:
+        except AuthFailedError:
+            retry.reset()
+            self.logger.warning('AUTH_FAILED closing')
+            client._session_callback(KeeperState.AUTH_FAILED)
+            return STOP_CONNECTING
+        except SessionExpiredError:
+            retry.reset()
+            self.logger.warning('Session has expired')
+            client._session_callback(KeeperState.EXPIRED_SESSION)
+        except RWServerAvailable:
+            retry.reset()
+            self.logger.warning('Found a RW server, dropping connection')
+            client._session_callback(KeeperState.CONNECTING)
+        except Exception:
+            self.logger.exception('Unhandled exception in connection loop')
+            raise
+        finally:
+            if self._socket is not None:
                 self._socket.close()
 
     def _connect(self, host, port):
         client = self.client
-        log.info('Connecting to %s:%s', host, port)
+        self.logger.info('Connecting to %s:%s', host, port)
 
-        if self.log_debug:
-            log.debug('    Using session_id: %r session_passwd: %s',
-                      client._session_id,
-                      hexlify(client._session_passwd))
+        self.logger.log(BLATHER,
+                        '    Using session_id: %r session_passwd: %s',
+                        client._session_id,
+                        hexlify(client._session_passwd))
 
         with self._socket_error_handling():
-            self._socket.connect((host, port))
+            self._socket = self.handler.create_connection(
+                (host, port), client._session_timeout / 1000.0)
 
         self._socket.setblocking(0)
 
@@ -506,7 +589,8 @@ class ConnectionHandler(object):
                           client._session_id or 0, client._session_passwd,
                           client.read_only)
 
-        connect_result, zxid = self._invoke(client._session_timeout, connect)
+        connect_result, zxid = self._invoke(
+            client._session_timeout / 1000.0, connect)
 
         if connect_result.time_out <= 0:
             raise SessionExpiredError("Session has expired")
@@ -516,19 +600,20 @@ class ConnectionHandler(object):
 
         # Load return values
         client._session_id = connect_result.session_id
+        client._protocol_version = connect_result.protocol_version
         negotiated_session_timeout = connect_result.time_out
         connect_timeout = negotiated_session_timeout / len(client.hosts)
         read_timeout = negotiated_session_timeout * 2.0 / 3.0
         client._session_passwd = connect_result.passwd
 
-        if self.log_debug:
-            log.debug('Session created, session_id: %r session_passwd: %s\n'
-                      '    negotiated session timeout: %s\n'
-                      '    connect timeout: %s\n'
-                      '    read timeout: %s', client._session_id,
-                      hexlify(client._session_passwd),
-                      negotiated_session_timeout, connect_timeout,
-                      read_timeout)
+        self.logger.log(BLATHER,
+                        'Session created, session_id: %r session_passwd: %s\n'
+                        '    negotiated session timeout: %s\n'
+                        '    connect timeout: %s\n'
+                        '    read timeout: %s', client._session_id,
+                        hexlify(client._session_passwd),
+                        negotiated_session_timeout, connect_timeout,
+                        read_timeout)
 
         if connect_result.read_only:
             client._session_callback(KeeperState.CONNECTED_RO)
@@ -539,7 +624,7 @@ class ConnectionHandler(object):
 
         for scheme, auth in client.auth_data:
             ap = Auth(0, scheme, auth)
-            zxid = self._invoke(connect_timeout, ap, xid=-4)
+            zxid = self._invoke(connect_timeout / 1000.0, ap, xid=AUTH_XID)
             if zxid:
                 client.last_zxid = zxid
         return read_timeout, connect_timeout

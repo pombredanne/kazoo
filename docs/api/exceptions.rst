@@ -20,6 +20,8 @@ Public API
 
 .. autoexception:: InvalidACLError
 
+.. autoexception:: LockTimeout
+
 .. autoexception:: NoChildrenForEphemeralsError
 
 .. autoexception:: NodeExistsError
@@ -49,6 +51,8 @@ Private API
 
 .. autoexception:: NoAuthError
 
+.. autoexception:: NotReadOnlyCallError
+
 .. autoexception:: InvalidCallbackError
 
 .. autoexception:: OperationTimeoutError
@@ -59,8 +63,12 @@ Private API
 
 .. autoexception:: SessionExpiredError
 
+.. autoexception:: SessionMovedError
+
 .. autoexception:: SystemZookeeperError
 
 .. autoexception:: UnimplementedError
+
+.. autoexception:: WriterNotClosedException
 
 .. autoexception:: ZookeeperStoppedError
